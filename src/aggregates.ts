@@ -79,9 +79,11 @@ export function launchpads(since: number, allTime: ReturnType<typeof launchpadsA
   const rows = Object.entries(allTime).map(([id, a]) => ({ ...padOf(id), ...a, window: inWindow.get(id) ?? zero }));
   const ranked = rows.toSorted((a, b) => b.window.organicGraduations - a.window.organicGraduations || b.allTime.organicGraduations - a.allTime.organicGraduations);
   const top = ranked.slice(0, LIST_LIMIT);
-  // The busiest identities in the window too, so the factories behind raw numbers show up.
-  const busiest = rows.toSorted((a, b) => b.window.launches - a.window.launches).slice(0, 10).filter((r) => r.window.launches && !top.includes(r));
-  return [...top, ...busiest];
+  // The busiest identities in the window too, so the factories behind raw numbers show up, and every
+  // named launchpad active in the window.
+  const active = rows.toSorted((a, b) => b.window.launches - a.window.launches)
+    .filter((r, i) => r.window.launches && !top.includes(r) && (i < 10 || r.name));
+  return [...top, ...active];
 }
 
 type Info = { shape: any; migrationThreshold: number; feeClaimer: string };

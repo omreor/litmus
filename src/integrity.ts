@@ -33,7 +33,17 @@ export const LAUNCHPAD_LABELS: Record<string, { name: string; website?: string }
   HW2Cg9ZYRGZRzXfdgc1pgGxdYduyVvYrYkg1H2PVLo1H: { name: "time.fun", website: "https://time.fun" },
   CFEEFQgVcTFNGgZ497y2wDPuZDYg1h4hNjoQ35mLGFZx: { name: "Candle" },
   GWtwk158mxsiUuy3Nw91rjQRNnra4foFXRt6ek3wFPT: { name: "Orynth" },
-  BSs3K3uAa3XqwqdwWD7KM7TUXBAnvzkrXwQoFwkKdt1R: { name: "Perpspad" },
+  BSs3K3uAa3XqwqdwWD7KM7TUXBAnvzkrXwQoFwkKdt1R: { name: "Perpspad", website: "https://perpspad.fun" },
+  // meteora.fyi screener pads (research/receipts.md §2); Jupiter files most of them under "met-dbc".
+  "4wYGg1KxUroz6Aitgmca64c5wqZW5q1cULCTRJ8dxhyL": { name: "OTC Desks", website: "https://otcdesks.cash" },
+  Fo6sbUoTeArwsd2Zk5RyxAG8nWYTsLtWB4U5vwDaem4j: { name: "ClawPump", website: "https://clawpump.tech" },
+  "2NKJXqxWY1YtC4jaqkC35sEU7XeW1cVfBdwUGgKigNKQ": { name: "Trends App", website: "https://apps.apple.com/us/app/trends-social/id6754299493" },
+  "38A38w6Y4ZTnBY2vB9DcaPfzpWPRfs9tJYqami9tohwx": { name: "LFOwn", website: "https://letsfuckingown.fun" },
+  "9rHYpiomWrMNhMb76BabYWzCVMYudBXqhHuQqJBRMrcR": { name: "OneOnly", website: "https://oneonly.lol" },
+  "95HeCzgwAu2xgbPGnBhL9GJ5FLz6bfWW2LDQ3PjzjdJN": { name: "Scribe", website: "https://www.scribe.ong" },
+  "875XeTAazsUnWQPovJTFwK71ap3mdrJcqtcS22ia4az8": { name: "Shift", website: "https://shiftfun.xyz" },
+  FcTNdg6B6cvw4gWTrKQ3VikTacRu9k7FeYHozGDmr2Vk: { name: "ChainRot", website: "https://chainrot.app" },
+  Dpmutmc4ZLqvJwHbwabvKYeFJ9zkQ86nutUAUviRrXG2: { name: "Hooked", website: "https://www.hookedpad.com" },
 };
 
 // Launchpads that mint a fresh fee claimer and leftover receiver per config but co-sign every config
