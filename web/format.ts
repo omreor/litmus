@@ -13,16 +13,28 @@ export const compact = (n: number) => compactFormat.format(n);
 export const pct = (x: number | null | undefined, digits = 0) => (x == null ? "–" : `${(x * 100).toFixed(digits)}%`);
 export const num = (n: number, digits = 1) => n.toLocaleString("en", { maximumFractionDigits: digits });
 
+// "36m", not "36m 0s".
+const pair = (major: number, majorUnit: string, minor: number, minorUnit: string) =>
+  `${major}${majorUnit}${minor ? ` ${minor}${minorUnit}` : ""}`;
+
 export function duration(seconds: number | null | undefined) {
   if (seconds == null) return "–";
   if (seconds === 0) return "same block";
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`;
-  return `${(seconds / 86400).toFixed(1)}d`;
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return pair(Math.floor(s / 60), "m", s % 60, "s");
+  if (s < 86400) return pair(Math.floor(s / 3600), "h", Math.floor((s % 3600) / 60), "m");
+  return `${(s / 86400).toFixed(1)}d`;
 }
 
 export const ago = (ts: number | null | undefined) => (ts ? `${duration(Date.now() / 1000 - ts)} ago` : "–");
+
+// Months arrive as "2026-09".
+const monthDate = (month: string) => new Date(`${month}-01T00:00:00Z`);
+export const monthLabel = (month: string) => `${monthDate(month).toLocaleString("en", { month: "short", timeZone: "UTC" })} '${month.slice(2, 4)}`;
+export const monthName = (month: string) => monthDate(month).toLocaleString("en", { month: "long", year: "numeric", timeZone: "UTC" });
+
+export const launchpadName = (launchpad: { id: string; name: string | null }) => launchpad.name ?? short(launchpad.id);
 
 export type Shape = {
   quoteMint: string;

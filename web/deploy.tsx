@@ -82,7 +82,7 @@ export function DeployPanel({ input, valid }: { input: StudioInput; valid: boole
   return (
     <section className="card">
       <h2>Deploy to mainnet</h2>
-      <p className="caption">Deploy this curve as a DBC config you own (you become fee claimer), then launch tokens on it. Anyone can launch on a config, so a good preset earns its owner partner fees.</p>
+      <p className="caption">Deploy these parameters as a DBC config you own (you become fee claimer, so partner fees on its pools are yours), then launch tokens on it.</p>
       {!account ? (
         wallets.length ? (
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>

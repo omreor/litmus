@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import type { Poll } from "./hooks";
 
 export type Point = { x: number; y: number };
 export type Series = { name: string; color: string; points: Point[] };
@@ -126,53 +127,150 @@ export function LineChart(props: {
   );
 }
 
+export type Column = { label: string; title?: string; values: number[]; detail?: string };
+
+// Rounded 4px data-end, square at the baseline.
+const columnPath = (x: number, y: number, w: number, h: number, r: number) =>
+  `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+
+// Few single-series columns carry their value on the cap. Denser or multi-series charts get a y-axis
+// instead, and their values live in the tooltip and the table view.
 export function ColumnChart(props: {
-  bars: { label: string; value: number; detail: string; color?: string }[];
-  height?: number;
+  columns: Column[];
+  series: { name: string; color: string }[];
   format: (v: number) => string;
-  color?: string;
+  tickFormat?: (v: number) => string;
+  stacked?: boolean;
   max?: number;
+  height?: number;
+  highlight?: { index: number; label: string };
 }) {
-  const { bars, height = 180, format, color = "var(--s1)", max } = props;
+  const { columns, series, format, tickFormat = format, stacked = false, max, height = 200, highlight } = props;
   const [ref, width] = useWidth<HTMLDivElement>();
   const [hover, setHover] = useState<number | null>(null);
-  const pad = { l: 8, r: 8, t: 20, b: 24 };
+  const axis = series.length > 1 || columns.length > 8;
+  const totals = columns.map((c) => (stacked ? c.values.reduce((s, v) => s + v, 0) : Math.max(...c.values)));
+  const ticks = niceTicks(max ?? Math.max(...totals, 0));
+  const top = max ?? ticks.at(-1)!;
+  const pad = { l: axis ? 8 + Math.max(...ticks.map((t) => tickFormat(t).length)) * 7 : 8, r: 8, t: 20, b: 24 };
+  const plotW = Math.max(width - pad.l - pad.r, 10);
   const plotH = height - pad.t - pad.b;
-  const top = max ?? Math.max(...bars.map((b) => b.value), 1e-9);
-  const band = (width - pad.l - pad.r) / bars.length;
-  const barW = Math.min(24, band * 0.6);
+  const sy = (v: number) => pad.t + plotH - (v / top) * plotH;
+  const band = plotW / columns.length;
+  const bars = stacked ? 1 : series.length;
+  const barW = Math.max(Math.min(24, (band * 0.7 - (bars - 1) * 2) / bars), 2);
+  const groupW = bars * barW + (bars - 1) * 2;
+  const center = (i: number) => pad.l + band * i + band / 2;
+  // Show every nth x label so labels never collide (~6px per character at 11px).
+  const every = Math.ceil((columns.length * (Math.max(...columns.map((c) => c.label.length)) * 6 + 6)) / plotW);
+  const dimmed = (i: number) => (hover !== null ? hover !== i : highlight !== undefined && highlight.index !== i);
+  const describe = (c: Column) =>
+    `${c.title ?? c.label}: ${series.map((s, j) => `${series.length > 1 ? `${s.name} ` : ""}${format(c.values[j])}`).join(", ")}`;
+
   return (
     <div className="chart" ref={ref}>
       {width > 0 && (
-        <svg width={width} height={height} role="img" aria-label={bars.map((b) => `${b.label}: ${format(b.value)}`).join("; ")}>
-          <line x1={pad.l} x2={width - pad.r} y1={pad.t + plotH} y2={pad.t + plotH} stroke="var(--axis)" />
-          {bars.map((b, i) => {
-            const h = (b.value / top) * plotH;
-            const x = pad.l + band * i + (band - barW) / 2;
-            const y = pad.t + plotH - h;
-            const r = Math.min(4, h / 2, barW / 2);
+        <svg width={width} height={height} role="img" aria-label={columns.map(describe).join("; ")}>
+          {axis
+            ? ticks.map((t) => (
+                <g key={t}>
+                  <line x1={pad.l} x2={width - pad.r} y1={sy(t)} y2={sy(t)} stroke={t ? "var(--grid)" : "var(--axis)"} />
+                  <text x={pad.l - 8} y={sy(t) + 4} textAnchor="end">{tickFormat(t)}</text>
+                </g>
+              ))
+            : <line x1={pad.l} x2={width - pad.r} y1={sy(0)} y2={sy(0)} stroke="var(--axis)" />}
+          {columns.map((c, i) => {
+            const x0 = center(i) - groupW / 2;
+            const topSegment = c.values.findLastIndex((v) => v > 0);
+            let base = 0;
             return (
-              <g key={b.label} onPointerEnter={() => setHover(i)} onPointerLeave={() => setHover(null)}>
+              <g key={c.label} onPointerEnter={() => setHover(i)} onPointerLeave={() => setHover(null)}>
                 <rect x={pad.l + band * i} y={pad.t} width={band} height={plotH + pad.b} fill="transparent" />
-                {h > 0 && (
-                  <path
-                    d={`M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + barW - r}Q${x + barW},${y} ${x + barW},${y + r}V${y + h}Z`}
-                    fill={b.color ?? color} opacity={hover === null || hover === i ? 1 : 0.6}
-                  />
+                <g opacity={dimmed(i) ? 0.45 : 1}>
+                  {c.values.map((v, s) => {
+                    const from = stacked ? base : 0;
+                    base += v;
+                    const x = stacked ? x0 : x0 + s * (barW + 2);
+                    const y = sy(from + v);
+                    // Stacked segments sit 2px above the one below (surface gap).
+                    const h = sy(from) - y - (from > 0 ? 2 : 0);
+                    if (h <= 0) return null;
+                    const r = !stacked || s === topSegment ? Math.min(4, h, barW / 2) : 0;
+                    return <path key={series[s].name} d={columnPath(x, y, barW, h, r)} fill={series[s].color} />;
+                  })}
+                </g>
+                {!axis && <text x={center(i)} y={sy(totals[i]) - 6} textAnchor="middle" className="value">{format(totals[i])}</text>}
+                {highlight?.index === i && <text x={center(i)} y={sy(totals[i]) - 6} textAnchor="middle" className="hl">{highlight.label}</text>}
+                {i % every === 0 && (
+                  <text x={center(i)} y={height - 6} textAnchor="middle" className={highlight?.index === i ? "hl" : undefined}>{c.label}</text>
                 )}
-                <text x={x + barW / 2} y={y - 6} textAnchor="middle" style={{ fill: "var(--text-2)" }}>{format(b.value)}</text>
-                <text x={x + barW / 2} y={height - 6} textAnchor="middle">{b.label}</text>
               </g>
             );
           })}
         </svg>
       )}
       {hover !== null && (
-        <div className="tooltip" style={{ left: Math.min(pad.l + band * hover + band / 2, width - 200), top: 0 }}>
-          <div className="row"><b>{format(bars[hover].value)}</b><span className="muted">{bars[hover].label}</span></div>
-          <div className="muted">{bars[hover].detail}</div>
+        <div className="tooltip" style={{ left: center(hover), top: 0, transform: `translateX(-${(center(hover) / width) * 100}%)` }}>
+          <div className="head">{columns[hover].title ?? columns[hover].label}</div>
+          {series.map((s, j) => (
+            <div className="row" key={s.name}>
+              <span className="key" style={{ background: s.color }} />
+              <b>{format(columns[hover].values[j])}</b>
+              {series.length > 1 && <span className="muted">{s.name}</span>}
+            </div>
+          ))}
+          {columns[hover].detail && <div className="muted">{columns[hover].detail}</div>}
         </div>
       )}
+      {series.length > 1 && (
+        <div className="legend">
+          {series.map((s) => (
+            <span className="item" key={s.name}>
+              <span className="rect" style={{ background: s.color }} />
+              {s.name}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function TableView({ head, rows }: { head: string[]; rows: (string | number)[][] }) {
+  return (
+    <details className="table-view">
+      <summary>Show as table</summary>
+      <div className="table-scroll">
+        <table>
+          <thead><tr>{head.map((h, i) => <th key={h} className={i ? "num" : undefined}>{h}</th>)}</tr></thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row[0]}>{row.map((v, i) => <td key={i} className={i ? "num" : undefined}>{v}</td>)}</tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  );
+}
+
+// Loading, error and empty states for a polled chart or table; renders nothing once there is data.
+export function Placeholder({ poll, empty, height }: { poll: Poll<unknown>; empty: string; height?: number }) {
+  const { data, error } = poll;
+  if (data && !(Array.isArray(data) && data.length === 0)) return null;
+  return (
+    <div className="empty" role="status" style={{ minHeight: height }}>
+      {data ? empty : error ? `Couldn't load this (${error}). Retrying…` : "Loading…"}
+    </div>
+  );
+}
+
+export function Tile({ label, value, sub }: { label: string; value: string; sub?: string | null }) {
+  return (
+    <div className="tile">
+      <div className="label">{label}</div>
+      <div className="value">{value}</div>
+      {sub && <div className="sub">{sub}</div>}
     </div>
   );
 }

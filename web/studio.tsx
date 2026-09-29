@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
-import { ColumnChart, LineChart, StackBar, type Series } from "./charts";
-import { compact, duration, num, pct, SOL_MINT } from "./format";
+import { ColumnChart, LineChart, Placeholder, StackBar, TableView, Tile, type Series } from "./charts";
+import { compact, duration, num, pct, short, SOL_MINT } from "./format";
 import { usePoll } from "./hooks";
 import { DeployPanel } from "./deploy";
+
+export type Fork = { address: string; label: string; info: any; stats?: { pools: number; graduated: number; contestedGraduated: number } };
 
 export type StudioInput = {
   quote: "SOL" | "USDC";
@@ -33,7 +35,7 @@ const DEFAULT_INPUT: StudioInput = {
 const POOL_FEES = [25, 30, 100, 200, 400, 600];
 const round = (x: number, digits = 2) => Math.round(x * 10 ** digits) / 10 ** digits;
 
-// Map a decoded on-chain config (from the Presets page) onto Studio inputs.
+// Map a decoded on-chain config onto Studio inputs.
 function fromConfig(info: any): StudioInput {
   const s = info.shape;
   return {
@@ -50,7 +52,11 @@ function fromConfig(info: any): StudioInput {
     feeEndBps: s.baseFee.startBps,
     dynamicFee: s.dynamicFee,
     creatorFeePct: s.creatorTradingFeePct,
-    lp: { partnerLocked: s.lp.partnerLocked, partner: s.lp.partner, creatorLocked: s.lp.creatorLocked, creator: s.lp.creator },
+    // The form has no LP vesting; vested LP maps to locked LP, the closest split it supports.
+    lp: {
+      partnerLocked: s.lp.partnerLocked + (s.lp.partnerVestingPct ?? 0), partner: s.lp.partner,
+      creatorLocked: s.lp.creatorLocked + (s.lp.creatorVestingPct ?? 0), creator: s.lp.creator,
+    },
     migratedPoolFeeBps: POOL_FEES.includes(s.migration.poolFeeBps) ? s.migration.poolFeeBps : 100,
   };
 }
@@ -69,8 +75,9 @@ function NumberInput({ value, onChange, step = 1, min = 0 }: { value: number; on
   return <input type="number" value={value} step={step} min={min} onChange={(e) => onChange(Number(e.target.value))} />;
 }
 
-export function Studio({ seed }: { seed: any }) {
-  const [input, setInput] = useState<StudioInput>(() => (seed ? fromConfig(seed) : DEFAULT_INPUT));
+export function Studio({ seed }: { seed: Fork | null }) {
+  const [fork, setFork] = useState(seed);
+  const [input, setInput] = useState<StudioInput>(() => (seed ? fromConfig(seed.info) : DEFAULT_INPUT));
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   const set = <K extends keyof StudioInput>(key: K) => (value: StudioInput[K]) => setInput((prev) => ({ ...prev, [key]: value }));
@@ -91,13 +98,20 @@ export function Studio({ seed }: { seed: any }) {
   const lpTotal = input.lp.partnerLocked + input.lp.partner + input.lp.creatorLocked + input.lp.creator;
   const series: Series[] = [];
   if (result) series.push({ name: "Your curve", color: "var(--s1)", points: result.curve.map((p: any) => ({ x: p.quote, y: p.mcap })) });
-  if (seed) series.push({ name: "Forked config", color: "var(--s2)", points: seed.curve.map((p: any) => ({ x: p.quote, y: p.mcap })) });
+  if (fork) series.push({ name: `Forked: ${fork.label}`, color: "var(--s2)", points: fork.info.curve.map((p: any) => ({ x: p.quote, y: p.mcap })) });
+  // Priors follow the last valid build, or the fork itself while the form doesn't build.
+  const priorsThreshold: number | undefined = result?.migrationThreshold ?? fork?.info.migrationThreshold;
+  const loadFork = (f: Fork) => {
+    setFork(f);
+    setInput(fromConfig(f.info));
+  };
 
   return (
     <div className="studio">
+      <ForkBar fork={fork} onFork={loadFork} />
       <section className="card form">
-        <h2>Design a launch</h2>
-        <p className="caption">Every change is rebuilt with Meteora's DBC SDK and validated like the program would.</p>
+        <h2>Parameters</h2>
+        <p className="caption">Loaded from the fork, or defaults. Every change is rebuilt with Meteora's DBC SDK and validated like the program would.</p>
         <fieldset>
           <legend>Economics</legend>
           <Field label="Quote token">
@@ -173,6 +187,7 @@ export function Studio({ seed }: { seed: any }) {
         </fieldset>
       </section>
       <div className="studio-out">
+        {priorsThreshold != null && <Priors threshold={priorsThreshold} quote={input.quote} />}
         <section className="card">
           <h2>Bonding curve</h2>
           <p className="caption">Market cap ({input.quote}) against {input.quote} raised, from launch to graduation.</p>
@@ -197,42 +212,110 @@ export function Studio({ seed }: { seed: any }) {
             </div>
           </section>
         )}
-        {result && <Benchmarks threshold={result.migrationThreshold} quote={input.quote} />}
         <DeployPanel input={input} valid={!!result && !error && lpTotal === 100} />
       </div>
     </div>
   );
 }
 
-type Bucket = { min: number; max: number | null; launches: number; graduated: number; medianSecondsToGraduate: number | null };
-const bucketLabel = (b: Bucket) => (b.max === null ? `${b.min}+` : `${b.min}-${b.max}`);
+const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const EXAMPLE = { address: "FbKf76ucsQssF7XZBuzScdJfugtsSKwZFYztKsMEhWZM", label: "Moonshot's main config" };
 
-function Benchmarks({ threshold, quote }: { threshold: number; quote: string }) {
-  const buckets = usePoll<Bucket[]>("/api/benchmarks/thresholds?window=604800", 60_000);
-  if (quote !== "SOL") return null;
-  const mine = buckets?.find((b) => threshold >= b.min && (b.max === null || threshold < b.max));
+function ForkBar({ fork, onFork }: { fork: Fork | null; onFork: (fork: Fork) => void }) {
+  const [address, setAddress] = useState("");
+  const [status, setStatus] = useState<string | null>(null);
+  const load = async (value: string) => {
+    const trimmed = value.trim();
+    setAddress(trimmed);
+    if (!BASE58.test(trimmed)) return setStatus("That isn't a Solana address.");
+    setStatus("Loading config…");
+    try {
+      const res = await fetch(`/api/configs/${trimmed}`);
+      const body = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+      const label = body.launchpad?.name ? `${body.launchpad.name} ${short(trimmed)}` : short(trimmed);
+      onFork({ address: trimmed, label, info: body.info, stats: body.stats });
+      setStatus(null);
+    } catch (e) {
+      setStatus(`Couldn't load that config (${e instanceof Error ? e.message : e}).`);
+    }
+  };
   return (
-    <section className="card">
-      <h2>How similar launches did</h2>
-      <p className="caption">Graduation rate of SOL-quoted launches seen in the last 7 days, by migration threshold. Your curve's bucket is highlighted.</p>
-      {mine && mine.launches > 0 ? (
-        <p>
-          Of <b>{mine.launches}</b> launches with {bucketLabel(mine)} SOL thresholds, <b>{mine.graduated}</b> graduated
-          ({pct(mine.graduated / mine.launches, 1)}){mine.graduated ? `, median ${duration(mine.medianSecondsToGraduate)} after launch` : ""}.
-        </p>
+    <section className="card fork">
+      <h2>Fork any config with outcome priors</h2>
+      <p className="caption">
+        Paste a DBC config address from any launchpad. Litmus decodes it from chain, loads its parameters below and shows how configs shaped like it
+        actually did.
+      </p>
+      <form
+        className="inline"
+        onSubmit={(e) => {
+          e.preventDefault();
+          load(address);
+        }}
+      >
+        <input aria-label="Config address" placeholder="Config address" value={address} onChange={(e) => setAddress(e.target.value)} spellCheck={false} autoComplete="off" />
+        <button className="btn">Fork</button>
+      </form>
+      <p className="muted" role="status">
+        {status ?? (fork ? (
+          <>
+            Forked <a className="mono" href={`https://solscan.io/account/${fork.address}`} target="_blank" rel="noreferrer">{fork.label}</a>
+            {fork.stats &&
+              `: ${num(fork.stats.pools, 0)} pools, ${num(fork.stats.graduated, 0)} graduated, ${num(fork.stats.contestedGraduated, 0)} contested`}
+            . Its curve is drawn next to yours.
+          </>
+        ) : (
+          <>Try <button type="button" className="link" onClick={() => load(EXAMPLE.address)}>{EXAMPLE.label}</button>.</>
+        ))}
+      </p>
+    </section>
+  );
+}
+
+type Bucket = { min: number; max: number | null; pools: number; organicPools: number; graduated: number; organicGraduated: number };
+const bucketLabel = (b: Bucket) => (b.max == null ? `${num(b.min)}+` : `${num(b.min)}-${num(b.max)}`);
+const rate = (graduated: number, pools: number) => (pools ? graduated / pools : 0);
+const outOf = (graduated: number, pools: number) => `${num(graduated, 0)} of ${num(pools, 0)} (${pct(rate(graduated, pools), 1)})`;
+
+// How every pool with a similar threshold did since April 2025; the API's "organic" is the contested subset.
+function Priors({ threshold, quote }: { threshold: number; quote: string }) {
+  const poll = usePoll<any>(`/api/benchmarks/similar?quote=${quote}&threshold=${Number(threshold.toFixed(2))}`, 60_000);
+  const b = poll.data;
+  const buckets: Bucket[] = b?.byThreshold ?? [];
+  const mine = buckets.findIndex((x) => threshold >= x.min && (x.max == null || threshold < x.max));
+  return (
+    <section className={poll.stale ? "card stale" : "card"}>
+      <h2>Outcome priors</h2>
+      <p className="caption">
+        Configs shaped like yours: every {quote}-quoted DBC pool since April 2025 with a migration threshold near {threshold.toLocaleString("en", { maximumSignificantDigits: 3 })} {quote}.
+      </p>
+      {b ? (
+        <>
+          <div className="tiles inset">
+            <Tile label="Contested graduation rate" value={pct(b.organicGradRate, 1)} sub={`${num(b.organicSample, 0)} contested pools`} />
+            <Tile label="Counting uncontested too" value={pct(b.gradRate, 1)} sub={`${num(b.sample, 0)} pools`} />
+            <Tile label="Median time to graduate" value={duration(b.medianSecondsToGraduate)} />
+          </div>
+          <ColumnChart
+            series={[{ name: "All pools", color: "var(--muted)" }, { name: "Contested", color: "var(--s1)" }]}
+            format={(v) => pct(v, 1)}
+            tickFormat={(v) => pct(v)}
+            highlight={mine >= 0 ? { index: mine, label: "yours" } : undefined}
+            columns={buckets.map((x) => ({
+              label: bucketLabel(x),
+              title: `${bucketLabel(x)} ${quote} threshold`,
+              values: [rate(x.graduated, x.pools), rate(x.organicGraduated, x.organicPools)],
+              detail: `${num(x.pools, 0)} pools, ${num(x.organicPools, 0)} contested`,
+            }))}
+          />
+          <TableView
+            head={[`Threshold (${quote})`, "All pools graduated", "Contested graduated"]}
+            rows={buckets.map((x) => [bucketLabel(x), outOf(x.graduated, x.pools), outOf(x.organicGraduated, x.organicPools)])}
+          />
+        </>
       ) : (
-        <p className="muted">No launches seen yet with a threshold near {num(threshold)} SOL.</p>
-      )}
-      {buckets && (
-        <ColumnChart
-          format={(v) => pct(v, 1)}
-          bars={buckets.map((b) => ({
-            label: `${bucketLabel(b)} SOL`,
-            value: b.launches ? b.graduated / b.launches : 0,
-            detail: `${b.graduated} of ${b.launches} graduated`,
-            color: b === mine ? "var(--s1)" : "var(--muted)",
-          }))}
-        />
+        <Placeholder poll={poll} empty="" height={300} />
       )}
     </section>
   );
