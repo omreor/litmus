@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ColumnChart, LineChart, Placeholder, StackBar, TableView, Tile, type Series } from "./charts";
 import { compact, duration, num, pct, short, SOL_MINT } from "./format";
-import { usePoll } from "./hooks";
+import { apiUrl, usePoll } from "./hooks";
 import { DeployPanel } from "./deploy";
 
 export type Fork = { address: string; label: string; info: any; stats?: { pools: number; graduated: number; contestedGraduated: number } };
@@ -85,12 +85,16 @@ export function Studio({ seed }: { seed: Fork | null }) {
 
   useEffect(() => {
     const id = setTimeout(async () => {
-      const res = await fetch("/api/studio/build", { method: "POST", body: JSON.stringify(input) });
-      const body = await res.json();
-      if (res.ok) {
-        setResult(body);
-        setError(null);
-      } else setError(body.error);
+      try {
+        const res = await fetch(apiUrl("/api/studio/build"), { method: "POST", body: JSON.stringify(input) });
+        const body = await res.json();
+        if (res.ok) {
+          setResult(body);
+          setError(null);
+        } else setError(body.error);
+      } catch (e) {
+        setError(`Couldn't reach the server (${e instanceof Error ? e.message : e}).`);
+      }
     }, 250);
     return () => clearTimeout(id);
   }, [input]);
@@ -230,7 +234,7 @@ function ForkBar({ fork, onFork }: { fork: Fork | null; onFork: (fork: Fork) => 
     if (!BASE58.test(trimmed)) return setStatus("That isn't a Solana address.");
     setStatus("Loading config…");
     try {
-      const res = await fetch(`/api/configs/${trimmed}`);
+      const res = await fetch(apiUrl(`/api/configs/${trimmed}`));
       const body = await res.json().catch(() => null);
       if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
       const label = body.launchpad?.name ? `${body.launchpad.name} ${short(trimmed)}` : short(trimmed);
@@ -278,7 +282,7 @@ const bucketLabel = (b: Bucket) => (b.max == null ? `${num(b.min)}+` : `${num(b.
 const rate = (graduated: number, pools: number) => (pools ? graduated / pools : 0);
 const outOf = (graduated: number, pools: number) => `${num(graduated, 0)} of ${num(pools, 0)} (${pct(rate(graduated, pools), 1)})`;
 
-// How every pool with a similar threshold did since April 2025; the API's "organic" is the contested subset.
+// How every pool with a similar threshold did since April 2025; the API's "organic" = not judged uncontested (contested + unverified).
 function Priors({ threshold, quote }: { threshold: number; quote: string }) {
   const poll = usePoll<any>(`/api/benchmarks/similar?quote=${quote}&threshold=${Number(threshold.toFixed(2))}`, 60_000);
   const b = poll.data;
@@ -293,12 +297,12 @@ function Priors({ threshold, quote }: { threshold: number; quote: string }) {
       {b ? (
         <>
           <div className="tiles inset">
-            <Tile label="Contested graduation rate" value={pct(b.organicGradRate, 1)} sub={`${num(b.organicSample, 0)} contested pools`} />
+            <Tile label="Graduation rate, uncontested excluded" value={pct(b.organicGradRate, 1)} sub={`${num(b.organicSample, 0)} pools not judged uncontested`} />
             <Tile label="Counting uncontested too" value={pct(b.gradRate, 1)} sub={`${num(b.sample, 0)} pools`} />
             <Tile label="Median time to graduate" value={duration(b.medianSecondsToGraduate)} />
           </div>
           <ColumnChart
-            series={[{ name: "All pools", color: "var(--muted)" }, { name: "Contested", color: "var(--s1)" }]}
+            series={[{ name: "All pools", color: "var(--muted)" }, { name: "Uncontested excluded", color: "var(--s1)" }]}
             format={(v) => pct(v, 1)}
             tickFormat={(v) => pct(v)}
             highlight={mine >= 0 ? { index: mine, label: "yours" } : undefined}
@@ -306,11 +310,11 @@ function Priors({ threshold, quote }: { threshold: number; quote: string }) {
               label: bucketLabel(x),
               title: `${bucketLabel(x)} ${quote} threshold`,
               values: [rate(x.graduated, x.pools), rate(x.organicGraduated, x.organicPools)],
-              detail: `${num(x.pools, 0)} pools, ${num(x.organicPools, 0)} contested`,
+              detail: `${num(x.pools, 0)} pools, ${num(x.organicPools, 0)} not judged uncontested`,
             }))}
           />
           <TableView
-            head={[`Threshold (${quote})`, "All pools graduated", "Contested graduated"]}
+            head={[`Threshold (${quote})`, "All pools graduated", "Graduated, uncontested excluded"]}
             rows={buckets.map((x) => [bucketLabel(x), outOf(x.graduated, x.pools), outOf(x.organicGraduated, x.organicPools)])}
           />
         </>

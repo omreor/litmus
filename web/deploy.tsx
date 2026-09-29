@@ -1,6 +1,7 @@
 import { getWallets } from "@wallet-standard/app";
 import type { Wallet, WalletAccount } from "@wallet-standard/base";
 import { useEffect, useState } from "react";
+import { apiUrl } from "./hooks";
 import type { StudioInput } from "./studio";
 
 const CONNECT = "standard:connect";
@@ -24,7 +25,7 @@ const toBytes = (b64: string) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(
 const toBase64 = (bytes: Uint8Array) => btoa(Array.from(bytes, (b) => String.fromCharCode(b)).join(""));
 
 async function post(url: string, body: unknown) {
-  const res = await fetch(url, { method: "POST", body: JSON.stringify(body) });
+  const res = await fetch(apiUrl(url), { method: "POST", body: JSON.stringify(body) });
   const json = await res.json();
   if (!res.ok) throw new Error(json.error ?? res.statusText);
   return json;

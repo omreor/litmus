@@ -1,5 +1,29 @@
 import { useEffect, useState } from "react";
 
+// Where the API lives. Served by Bun (no live.json): same origin. On GitHub Pages: the tunnel named in
+// live.json when its /api/health answers within 3 s, else the JSON snapshots published next to the page.
+export type Source = { mode: "local" | "live" | "snapshot"; base: string; at: number | null };
+
+async function resolveSource(): Promise<Source> {
+  let live: { url: string | null; at: number } | null = null;
+  try {
+    const res = await fetch("live.json", { cache: "no-store" });
+    if (res.ok) live = await res.json();
+  } catch {}
+  if (!live) return { mode: "local", base: "", at: null };
+  try {
+    if (live.url && (await fetch(`${live.url}/api/health`, { signal: AbortSignal.timeout(3000) })).ok) return { mode: "live", base: live.url, at: live.at };
+  } catch {}
+  return { mode: "snapshot", base: "", at: live.at };
+}
+
+export const source = await resolveSource();
+
+// Snapshot files are named after the route: /api/templates?window=3600&organic=1 -> data/templates_window_3600_organic_1.json
+// (scripts/publish.sh writes them).
+export const apiUrl = (path: string) =>
+  source.mode === "snapshot" ? `data/${path.replace(/^\/api\//, "").replace(/[/?&=]/g, "_")}.json` : source.base + path;
+
 export type Poll<T> = { data: T | null; error: string | null; stale: boolean };
 
 // `stale` is true while the data on screen belongs to a previous URL (a filter just changed).
@@ -10,7 +34,7 @@ export function usePoll<T>(url: string | null, ms: number): Poll<T> {
     let alive = true;
     const load = async () => {
       try {
-        const res = await fetch(url);
+        const res = await fetch(apiUrl(url));
         const body = await res.json().catch(() => null);
         if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
         if (alive) setState({ url, data: body, error: null });
@@ -20,7 +44,7 @@ export function usePoll<T>(url: string | null, ms: number): Poll<T> {
       }
     };
     load();
-    const id = setInterval(load, ms);
+    const id = source.mode === "snapshot" ? undefined : setInterval(load, ms);
     return () => {
       alive = false;
       clearInterval(id);
@@ -31,9 +55,12 @@ export function usePoll<T>(url: string | null, ms: number): Poll<T> {
 
 export type Launchpad = { id: string; name: string | null };
 
-// Verdict fields: contested/evidence/receipts, plus the v2 aliases organic/reasons (pools) and factory/factoryReasons (templates).
+export type Verdict = "contested" | "uncontested" | "unverified";
+
+// Verdict fields of pools and stream items, plus the v2 aliases organic/reasons; templates carry a prior (factory/factoryReasons).
 export type Judged = {
-  contested?: boolean;
+  verdict?: Verdict;
+  contested?: boolean | null;
   evidence?: Record<string, string | number> | null;
   receipts?: string[];
   organic?: boolean;
@@ -42,7 +69,8 @@ export type Judged = {
   factoryReasons?: string[];
 };
 
-export const contestedOf = (x: Judged) => x.contested ?? x.organic ?? (x.factory === undefined ? undefined : !x.factory);
+// A template's prior only ever flags it uncontested; pools and stream items carry their own verdict.
+export const verdictOf = (x: Judged): Verdict | undefined => x.verdict ?? (x.factory ? "uncontested" : undefined);
 
 export type FeedItem = Judged & {
   type: "launch" | "graduation" | "config";
@@ -59,10 +87,11 @@ export type FeedItem = Judged & {
 export function useFeed(limit = 60) {
   const [items, setItems] = useState<FeedItem[]>([]);
   useEffect(() => {
+    if (source.mode === "snapshot") return;
     let ws: WebSocket;
     let closed = false;
     const connect = () => {
-      ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/stream`);
+      ws = new WebSocket(`${(source.base || location.origin).replace(/^http/, "ws")}/api/stream`);
       ws.onmessage = (e) => setItems((prev) => [JSON.parse(e.data), ...prev].slice(0, limit));
       ws.onclose = () => !closed && setTimeout(connect, 2000);
     };
@@ -78,10 +107,9 @@ export function useFeed(limit = 60) {
 export type Graduation = FeedItem & { fresh: boolean };
 
 // Every graduation seen this session, newest first: seeded from /api/graduations/recent so it's never
-// empty, then merged with the live stream. Deduped by transaction and pool; `fresh` marks live arrivals.
-export function useGraduations() {
+// empty, then merged with the live stream (`feed`, from useFeed). Deduped by transaction and pool; `fresh` marks live arrivals.
+export function useGraduations(feed: FeedItem[]) {
   const recent = usePoll<FeedItem[]>("/api/graduations/recent?limit=50", 60_000);
-  const feed = useFeed();
   const [seen, setSeen] = useState<{ items: Graduation[]; keys: Set<string> }>({ items: [], keys: new Set() });
   const merge = (incoming: FeedItem[]) =>
     setSeen((prev) => {

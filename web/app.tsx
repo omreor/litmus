@@ -4,13 +4,15 @@ import { ColumnChart, LineChart, Meter, Placeholder, StackBar, TableView, Tile, 
 import {
   ago, compact, duration, feeLabel, launchpadName, lpLabel, monthLabel, monthName, num, pct, presetLabel, quoteAmount, quoteSymbol, short, SOL_MINT,
 } from "./format";
-import { contestedOf, useFeed, useGraduations, usePoll, useTick, type Judged, type Launchpad } from "./hooks";
+import { apiUrl, source, useFeed, useGraduations, usePoll, useTick, verdictOf, type Judged, type Launchpad, type Verdict } from "./hooks";
 import { Studio, type Fork } from "./studio";
 
 const SERIES_COLORS = ["var(--s1)", "var(--s2)", "var(--s3)"];
+// Stacked in this order; the three colors pass the dataviz palette validator as adjacent pairs on the dark surface.
 const VERDICTS = [
   { name: "Contested", color: "var(--s1)" },
-  { name: "Uncontested", color: "var(--muted)" },
+  { name: "Unverified", color: "var(--s3)" },
+  { name: "Uncontested", color: "var(--s2)" },
 ];
 const WINDOWS = [
   { label: "1h", seconds: 3600 },
@@ -27,9 +29,13 @@ const TITLES: Record<Tab, string> = {
 };
 // Below this many pools a rate is noise: it's shown as "–" or ranked last.
 const MIN_SAMPLE = 20;
+const ODDS_SAMPLE = 5;
 
 // Sub-1 amounts keep two significant digits: a 0.00001 SOL threshold must not read as 0.
 const amount = (v: number) => (v >= 10_000 ? compact(v) : v >= 1 ? num(v, 2) : v.toLocaleString("en", { maximumSignificantDigits: 2 }));
+
+// Keeps tiny shares readable: 25 of 92,544 is 0.03%, not 0.0%.
+const share = (x: number | null) => (x != null && x > 0 && x < 0.001 ? `${(x * 100).toPrecision(1)}%` : pct(x, 1));
 
 const tabFromHash = () => {
   const hash = location.hash.slice(1);
@@ -63,12 +69,22 @@ function App() {
             <a key={id} href={`#${id}`} aria-current={tab === id ? "page" : undefined}>{label}</a>
           ))}
         </nav>
-        <div className="status">
-          <span className="dot" style={{ background: live ? "var(--good)" : "var(--muted)" }} />
-          {live ? `Live via ${health.transport}` : "Connecting"}
-          {health?.slot ? <span className="mono muted">slot {health.slot.toLocaleString()}</span> : null}
-        </div>
+        {source.mode === "snapshot" ? (
+          <div className="status"><span className="dot" style={{ background: "var(--warning)" }} />Snapshot</div>
+        ) : (
+          <div className="status">
+            <span className="dot" style={{ background: live ? "var(--good)" : "var(--muted)" }} />
+            {live ? `Live via ${health.transport}` : "Connecting"}
+            {health?.slot ? <span className="mono muted">slot {health.slot.toLocaleString()}</span> : null}
+          </div>
+        )}
       </header>
+      {source.mode === "snapshot" && (
+        <p className="banner" role="status">
+          Snapshot as of {source.at ? new Date(source.at * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "the last publish"}. The live
+          server is offline, so the feed and the Studio are paused; figures are from the latest published snapshot.
+        </p>
+      )}
       {(tab === "radar" || tab === "launchpads" || tab === "templates") && (
         <div className="filters">
           <div className="group" role="group" aria-label="Time window">
@@ -98,7 +114,9 @@ function App() {
           />
         )}
         {tab === "integrity" && <Integrity />}
-        {tab === "studio" && <Studio seed={fork} />}
+        {tab === "studio" && (source.mode === "snapshot"
+          ? <div className="card empty">The Studio builds and deploys configs through the live server, which is offline right now. Try again later.</div>
+          : <Studio seed={fork} />)}
         {tab === "api" && <ApiDocs />}
       </Boundary>
     </div>
@@ -117,6 +135,15 @@ class Boundary extends Component<{ children: ReactNode }, { error: string | null
   }
 }
 
+const VERDICT_TEXT: Record<Verdict, { label: string; caption: string }> = {
+  contested: { label: "Contested", caption: "Independent buyers competed to fill the curve." },
+  uncontested: { label: "Uncontested", caption: "A rule fired: the curve was set up or filled without real competition." },
+  unverified: {
+    label: "Unverified",
+    caption: "No rule fired, but competition isn't confirmed: that takes independent buyers seen in its transactions from creation.",
+  },
+};
+
 // Evidence as display lines; v2 `reasons` / `factoryReasons` stand in when a payload has no evidence yet.
 const evidenceOf = (x: Judged) =>
   x.evidence ? Object.entries(x.evidence).map(([key, value]) => `${key}: ${typeof value === "number" ? num(value, 2) : value}`) : x.reasons ?? x.factoryReasons ?? [];
@@ -124,20 +151,20 @@ const evidenceOf = (x: Judged) =>
 // Verdict badge; opens a popover with the evidence and the transactions behind it.
 function Verdict({ of: x, prior = false }: { of: Judged; prior?: boolean }) {
   const id = useId();
-  const contested = contestedOf(x);
-  if (contested === undefined) return null;
-  const label = contested ? "Contested" : "Uncontested";
+  const verdict = verdictOf(x);
+  if (!verdict) return null;
+  const { label, caption } = VERDICT_TEXT[verdict];
   const evidence = evidenceOf(x);
   const stop = (e: React.MouseEvent) => e.stopPropagation();
   return (
     <>
-      <button className={contested ? "flag contested" : "flag uncontested"} popoverTarget={id} onClick={stop} title="Show evidence">{label}</button>
+      <button className={`flag ${verdict}`} popoverTarget={id} onClick={stop} title="Show evidence">{label}</button>
       <div id={id} popover="auto" className="evidence" onClick={stop}>
         <h3>{label}</h3>
         <p className="caption">
           {prior
             ? "Template prior: pools on these parameters complete without real competition. Each pool is still judged on its own evidence."
-            : contested ? "Independent buyers competed to fill the curve." : "The curve was completed without real competition."}
+            : caption}
         </p>
         {evidence.length > 0 ? <ul>{evidence.map((e) => <li key={e}>{e}</li>)}</ul> : <p className="muted">No evidence attached.</p>}
         {x.receipts?.length ? (
@@ -157,30 +184,40 @@ function Verdict({ of: x, prior = false }: { of: Judged; prior?: boolean }) {
 function Radar({ windowSeconds, hideUncontested }: { windowSeconds: number; hideUncontested: boolean }) {
   const overviewPoll = usePoll<any>(`/api/overview?window=${windowSeconds}`, 5000);
   const hotPoll = usePoll<any[]>("/api/pools/hot", 5000);
-  const feed = useFeed();
+  const live = useFeed();
+  // Graduations are seeded from the latest judged ones, so the feed isn't empty before the stream delivers.
+  const feed = [...live.filter((i) => i.type !== "graduation"), ...useGraduations(live).items].sort((a, b) => b.ts - a.ts).slice(0, 60);
   const overview = overviewPoll.data;
-  const hot = hideUncontested ? hotPoll.data?.filter((p) => contestedOf(p) !== false) : hotPoll.data;
-  const items = hideUncontested ? feed.filter((item) => contestedOf(item) !== false) : feed;
+  const notUncontested = (x: Judged) => verdictOf(x) !== "uncontested";
+  const hot = hideUncontested ? hotPoll.data?.filter(notUncontested) : hotPoll.data;
+  const items = hideUncontested ? feed.filter(notUncontested) : feed;
+  const hasOdds = hot?.some((p) => p.odds);
   const solVolume = overview?.volume.find((v: any) => v.mint === SOL_MINT);
   const volumeSol = solVolume ? quoteAmount(solVolume.volume, SOL_MINT) : 0;
-  const launches = hideUncontested ? overview?.organic.launches : overview?.launches;
-  const graduations = hideUncontested ? overview?.organic.graduations : overview?.graduations;
-  const split = (all: number, contested: number) =>
-    hideUncontested ? `${compact(all - contested)} uncontested hidden` : `${compact(contested)} contested`;
+  // The API's `organic` = not judged uncontested, so unverified = organic - contested.
+  const verdicts = (key: "launches" | "graduations") => ({
+    all: overview[key] as number, contested: overview.contested[key] as number,
+    unverified: overview.organic[key] - overview.contested[key], uncontested: overview[key] - overview.organic[key],
+  });
+  const verdictTile = (key: "launches" | "graduations", label: string) => {
+    if (!overview) return <Tile label={label} value="–" />;
+    const v = verdicts(key);
+    return hideUncontested ? (
+      <Tile label={`Contested ${key}`} value={num(v.contested, 0)} sub={`${compact(v.unverified)} unverified · ${compact(v.uncontested)} uncontested hidden`} />
+    ) : (
+      <Tile label={label} value={compact(v.all)} sub={`${compact(v.contested)} contested · ${compact(v.unverified)} unverified`} />
+    );
+  };
+  const launches = overview && (hideUncontested ? overview.organic.launches : overview.launches);
+  const graduations = overview && (hideUncontested ? overview.organic.graduations : overview.graduations);
   return (
     <>
       <div className={overviewPoll.stale ? "tiles stale" : "tiles"}>
-        <Tile
-          label={hideUncontested ? "Contested launches" : "Launches"} value={overview ? compact(launches) : "–"}
-          sub={overview && split(overview.launches, overview.organic.launches)}
-        />
-        <Tile
-          label={hideUncontested ? "Contested graduations" : "Graduations"} value={overview ? compact(graduations) : "–"}
-          sub={overview && split(overview.graduations, overview.organic.graduations)}
-        />
+        {verdictTile("launches", "Launches")}
+        {verdictTile("graduations", "Graduations")}
         <Tile
           label="Graduation rate" value={launches >= MIN_SAMPLE ? pct(graduations / launches, 1) : "–"}
-          sub={overview && launches < MIN_SAMPLE ? `needs ${MIN_SAMPLE}+ launches in window` : "graduations / launches"}
+          sub={overview && launches < MIN_SAMPLE ? `needs ${MIN_SAMPLE}+ launches in window` : hideUncontested ? "graduations / launches, uncontested excluded" : "graduations / launches"}
         />
         <Tile
           label="Volume" value={overview ? `${compact(volumeSol)} SOL` : "–"}
@@ -191,11 +228,17 @@ function Radar({ windowSeconds, hideUncontested }: { windowSeconds: number; hide
       <div className="grid-2">
         <section className="card">
           <h2>Closest to graduation</h2>
-          <p className="caption">Pools traded in the last 10 minutes, by progress to their own migration threshold. Odds: how often pools of the same template that got this far went on to graduate.</p>
+          <p className="caption">
+            Pools traded in the last 10 minutes, by progress to their own migration threshold.
+            {hasOdds ? " Odds: how often pools of the same template that got this far went on to graduate." : ""}
+          </p>
           <div className="table-scroll live">
             <table>
               <thead>
-                <tr><th>Token</th><th>Progress</th><th className="num wide">Reserve</th><th className="num wide">Trades</th><th className="num">Odds</th><th className="num">Last trade</th></tr>
+                <tr>
+                  <th>Token</th><th>Progress</th><th className="num wide">Reserve</th><th className="num wide">Trades</th>{hasOdds && <th className="num">Odds</th>}
+                  <th className="num">Last trade</th>
+                </tr>
               </thead>
               <tbody>
                 {hot?.map((p) => (
@@ -207,7 +250,9 @@ function Radar({ windowSeconds, hideUncontested }: { windowSeconds: number; hide
                       {quoteSymbol(p.quote_mint ?? SOL_MINT, p.quote_symbol)}
                     </td>
                     <td className="num wide">{num(p.trades, 0)}</td>
-                    <td className="num" title={p.odds ? `${p.odds.sample} pools reached ${pct(p.odds.step)}` : "not enough settled pools yet"}>{p.odds ? pct(p.odds.rate, 1) : "–"}</td>
+                    {hasOdds && (
+                      <td className="num" title={p.odds ? `${p.odds.sample} pools reached ${pct(p.odds.step)}` : "not enough settled pools yet"}>{p.odds ? pct(p.odds.rate, 1) : "–"}</td>
+                    )}
                     <td className="num muted time">{ago(p.last_trade_at)}</td>
                   </tr>
                 ))}
@@ -226,7 +271,7 @@ function Radar({ windowSeconds, hideUncontested }: { windowSeconds: number; hide
           <ul className="feed">
             {items.map((item) => (
               <li key={`${item.sig}-${item.type}-${item.pool ?? item.config}`}>
-                <span className="dot" style={{ background: { launch: "var(--s1)", graduation: "var(--good)", config: "var(--s2)" }[item.type] }} />
+                <span className="dot" style={{ background: { launch: "var(--text-2)", graduation: "var(--good)", config: "var(--muted)" }[item.type] }} />
                 <div className="what">
                   <div className="kind">
                     {{ launch: "Launch", graduation: "Graduated", config: "New config" }[item.type]}
@@ -241,7 +286,11 @@ function Radar({ windowSeconds, hideUncontested }: { windowSeconds: number; hide
                 <a className="when" href={`https://solscan.io/tx/${item.sig}`} target="_blank" rel="noreferrer">{ago(item.ts)}</a>
               </li>
             ))}
-            {items.length === 0 && <li className="empty">{feed.length ? "Only uncontested activity so far. Untick Hide uncontested to see it." : "Listening…"}</li>}
+            {items.length === 0 && (
+              <li className="empty">
+                {source.mode === "snapshot" ? "The live feed is paused while the server is offline." : feed.length ? "Only uncontested activity so far. Untick Hide uncontested to see it." : "Listening…"}
+              </li>
+            )}
           </ul>
         </section>
       </div>
@@ -249,18 +298,16 @@ function Radar({ windowSeconds, hideUncontested }: { windowSeconds: number; hide
   );
 }
 
-// `judged` shows an Uncontested badge; contested rows stay unbadged to keep tables quiet.
+// `judged` adds the pool's verdict badge, first on the second line so it is never cut off.
 function TokenCell(props: {
   name?: string | null; symbol?: string | null; mint?: string | null; pool: string; launchpad?: Launchpad | null; judged?: Judged;
 }) {
   const { name, symbol, mint, pool, launchpad, judged } = props;
   return (
     <div className="token">
-      <div className="name-row">
-        <a href={`https://solscan.io/account/${pool}`} target="_blank" rel="noreferrer"><b dir="auto">{name || short(mint ?? pool)}</b></a>
-        {judged && contestedOf(judged) === false && <Verdict of={judged} />}
-      </div>
+      <a href={`https://solscan.io/account/${pool}`} target="_blank" rel="noreferrer"><b dir="auto">{name || short(mint ?? pool)}</b></a>
       <span>
+        {judged && <Verdict of={judged} />}
         {symbol ? <>$<bdi>{symbol}</bdi></> : "unknown token"}
         {launchpad ? ` · ${launchpadName(launchpad)}` : ""}
       </span>
@@ -268,7 +315,8 @@ function TokenCell(props: {
   );
 }
 
-// Share of graduated pools whose DAMM v2 pool still had liquidity and volume 7 days on.
+// Share of graduated pools whose DAMM v2 pool still had liquidity and volume 7 days on. The column shows only once some row has data.
+const hasAlive7d = (rows?: any[]) => !!rows?.some((r) => r.postGraduation?.graduated);
 function Alive7d({ post }: { post?: { graduated: number; aliveD7: number } | null }) {
   if (!post?.graduated) return <span className="muted">–</span>;
   return <>{pct(post.aliveD7 / post.graduated, 1)}<div className="sub">of {num(post.graduated, 0)}</div></>;
@@ -279,13 +327,14 @@ function Launchpads({ windowSeconds }: { windowSeconds: number }) {
   const rows = poll.data?.toSorted(
     (a, b) => b.window.organicGraduations - a.window.organicGraduations || b.allTime.organicGraduations - a.allTime.organicGraduations,
   );
-  const hasPost = rows?.some((l) => l.postGraduation !== undefined);
+  const hasPost = hasAlive7d(rows);
   return (
     <section className="card">
       <h2>Launchpad leaderboard</h2>
       <p className="caption">
-        Ranked by contested graduations in the window. Launchpads are identified from on-chain partner metadata, Jupiter's launchpad labels
-        and the wallets behind their configs. Contested grad rate and median time to graduate (over contested graduations) are all-time since April 2025
+        Ranked by graduations in the window with uncontested ones excluded: contested plus unverified (no rule fired, transactions not replayed yet).
+        Launchpads are identified from on-chain partner metadata, Jupiter's launchpad labels and the wallets behind their configs. Contested
+        graduations, graduation rate and median time to graduate are all-time since April 2025, the last two with uncontested pools excluded
         {hasPost ? "; alive at 7d is the share of graduated pools whose DAMM v2 pool still had liquidity and volume a week later" : ""}.
         Uncontested share: the launchpad's pools <a href="#integrity">judged uncontested</a>.
       </p>
@@ -293,19 +342,21 @@ function Launchpads({ windowSeconds }: { windowSeconds: number }) {
         <table>
           <thead>
             <tr>
-              <th className="num">#</th><th>Launchpad</th><th className="num">Contested graduations</th><th className="num wide">Contested launches</th>
-              <th className="num">Contested grad rate</th>{hasPost && <th className="num">Alive at 7d</th>}<th className="num wide">Pools, all-time</th>
+              <th className="num wide">#</th><th>Launchpad</th><th className="num">Graduations excl. uncontested</th>
+              <th className="num wide">Launches excl. uncontested</th><th className="num wide">Contested graduations, all-time</th>
+              <th className="num wide">Grad rate excl. uncontested</th>{hasPost && <th className="num">Alive at 7d</th>}<th className="num wide">Pools, all-time</th>
               <th className="num wide">Median time to graduate</th><th className="num">Uncontested share</th>
             </tr>
           </thead>
           <tbody>
             {rows?.map((l, i) => (
               <tr key={l.id}>
-                <td className="num muted">{i + 1}</td>
+                <td className="num muted wide">{i + 1}</td>
                 <td><LaunchpadCell launchpad={l} /></td>
                 <td className="num"><b>{num(l.window.organicGraduations, 0)}</b><div className="sub">of {num(l.window.graduations, 0)}</div></td>
                 <td className="num wide">{num(l.window.organicLaunches, 0)}<div className="sub">of {num(l.window.launches, 0)}</div></td>
-                <td className="num">
+                <td className="num wide">{num(l.allTime.contestedGraduations ?? 0, 0)}</td>
+                <td className="num wide">
                   {l.allTime.organicPools >= MIN_SAMPLE ? pct(l.allTime.organicGraduations / l.allTime.organicPools, 1) : "–"}
                   <div className="sub">of {num(l.allTime.organicPools, 0)}</div>
                 </td>
@@ -346,7 +397,7 @@ const byContestedOutcome = (a: any, b: any) =>
 function Templates({ windowSeconds, hideUncontested, onFork }: { windowSeconds: number; hideUncontested: boolean; onFork: (fork: Fork) => void }) {
   const poll = usePoll<any[]>(`/api/templates?window=${windowSeconds}${hideUncontested ? "&organic=1" : ""}`, 30_000);
   const rows = poll.data?.toSorted(byContestedOutcome);
-  const hasPost = rows?.some((t) => t.postGraduation !== undefined);
+  const hasPost = hasAlive7d(rows);
   const [selected, setSelected] = useState<string | null>(null);
   const current = rows?.find((t) => t.template === selected) ?? rows?.[0];
   const detail = usePoll<any>(current ? `/api/templates/${current.template}` : null, 30_000);
@@ -361,16 +412,16 @@ function Templates({ windowSeconds, hideUncontested, onFork }: { windowSeconds: 
         <h2>Templates</h2>
         <p className="caption">
           Configs grouped by parameter template: quote, threshold, fees, LP split and migration. Launchpads mint a config per token, so the
-          template is the real preset. Ranked by contested graduation rate, with uncontested pools set aside; templates with under {MIN_SAMPLE} pools
-          in the window come last. Median time to graduate counts contested graduations only. A template's Uncontested badge is a prior from its
-          history: each pool is still judged on its own evidence.
+          template is the real preset. Ranked by graduation rate with uncontested pools set aside (contested plus unverified pools); templates with
+          under {MIN_SAMPLE} pools in the window come last. Median time to graduate excludes uncontested graduations. A template's Uncontested badge
+          is a prior from its history: each pool is still judged on its own evidence.
         </p>
         <div className={poll.stale ? "table-scroll stale" : "table-scroll"}>
           <table>
             <thead>
               <tr>
                 <th>Template</th><th className="wide">Launchpad</th><th className="num wide">Threshold</th><th className="num">Pools</th>
-                <th className="num wide">Graduated</th><th className="num">Contested rate</th>{hasPost && <th className="num">Alive at 7d</th>}
+                <th className="num wide">Graduated</th><th className="num">Graduated excl. uncontested</th>{hasPost && <th className="num">Alive at 7d</th>}
                 <th className="num wide">Median time to graduate</th>
               </tr>
             </thead>
@@ -381,7 +432,7 @@ function Templates({ windowSeconds, hideUncontested, onFork }: { windowSeconds: 
                     <div className="token">
                       <div className="name-row">
                         <button className="link" aria-pressed={t === current}><b>{t.label}</b></button>
-                        {contestedOf(t) === false && <Verdict of={t} prior />}
+                        <Verdict of={t} prior />
                       </div>
                       <span>{presetLabel(t.shape)}</span>
                     </div>
@@ -420,16 +471,19 @@ function TemplateDetail({ detail, row, onFork }: { detail: any; row: any; onFork
     points: c.info.curve.map((p: any) => ({ x: p.quote, y: p.mcap })),
   }));
   const split = info.supplySplit;
-  const hasPost = detail.recent.some((p: any) => p.postGraduation !== undefined);
+  const hasPost = detail.recent.some((p: any) => p.postGraduation);
+  // Same floor as the live odds: a step reached by fewer settled pools than this is noise.
+  const odds = detail.odds.filter((o: any) => o.reached >= ODDS_SAMPLE);
   return (
     <div className="detail">
       <section className="card full">
         <div className="detail-head">
           <div>
-            <div className="name-row"><h2>{detail.label}</h2>{contestedOf(detail) === false && <Verdict of={detail} prior />}</div>
+            <div className="name-row"><h2>{detail.label}</h2><Verdict of={detail} prior /></div>
             <p className="caption">
               {row.launchpad ? launchpadName(row.launchpad) : "No launchpad identified"} · {num(row.pools, 0)} pools in window ·{" "}
-              {pct(row.gradRate, 1)} graduated, {pct(row.organicGradRate, 1)} contested · median {duration(row.medianSecondsToGraduate)} to a contested graduation
+              {pct(row.gradRate, 1)} graduated, {pct(row.organicGradRate, 1)} with uncontested pools excluded · median{" "}
+              {duration(row.medianSecondsToGraduate)} to graduate, uncontested excluded
             </p>
           </div>
           <button className="btn" onClick={() => onFork({ address: lead.address, label: detail.label, info })}>Fork with priors</button>
@@ -443,12 +497,12 @@ function TemplateDetail({ detail, row, onFork }: { detail: any; row: any; onFork
       <section className="card">
         <h2>Graduation odds by progress</h2>
         <p className="caption">Share of settled pools that graduated after reaching each progress step.</p>
-        {detail.odds.some((o: any) => o.reached > 0) ? (
+        {odds.length ? (
           <ColumnChart
             max={1}
             format={(v) => pct(v, 1)}
             series={[{ name: "Graduated", color: "var(--s1)" }]}
-            columns={detail.odds.map((o: any) => ({
+            columns={odds.map((o: any) => ({
               label: `≥${pct(o.step)}`,
               title: `Reached ${pct(o.step)} of threshold`,
               values: [o.reached ? o.graduated / o.reached : 0],
@@ -456,7 +510,9 @@ function TemplateDetail({ detail, row, onFork }: { detail: any; row: any; onFork
             }))}
           />
         ) : (
-          <div className="empty">No settled pools yet. A pool counts once it graduates or goes 6 hours without a trade.</div>
+          <div className="empty">
+            Fewer than {ODDS_SAMPLE} settled pools watched from creation so far. A pool counts once it graduates or goes 6 hours without a trade.
+          </div>
         )}
       </section>
       <section className="card">
@@ -480,7 +536,7 @@ function TemplateDetail({ detail, row, onFork }: { detail: any; row: any; onFork
       <section className="card full">
         <h2>Recent launches</h2>
         <p className="caption">
-          Each pool is judged on its own evidence{hasPost ? "; post-graduation shows its DAMM v2 pool's liquidity and 24h volume 1 and 7 days after graduating" : ""}.
+          Each pool is judged on its own evidence{hasPost ? "; post-graduation shows its DAMM v2 pool's liquidity now, and liquidity and volume 1 and 7 days after graduating once those snapshots exist" : ""}.
         </p>
         <div className="table-scroll">
           <table>
@@ -506,70 +562,100 @@ function TemplateDetail({ detail, row, onFork }: { detail: any; row: any; onFork
   );
 }
 
-type PoolDay = { liquidityUsd: number; volumeUsd: number } | null;
-function PostGraduation({ post }: { post?: { d1: PoolDay; d7: PoolDay; lpPulled: boolean } | null }) {
+type PoolDay = { liquidityUsd: number; volumeUsd: number | null } | null;
+function PostGraduation({ post }: { post?: { d1: PoolDay; d7: PoolDay; lpPulled: boolean; current?: { liquidityUsd: number } } | null }) {
   if (!post) return <span className="muted">–</span>;
   if (post.lpPulled) return <>LP pulled</>;
-  const day = (d: PoolDay, n: number) => (d ? `D+${n} $${compact(d.liquidityUsd)} liq · $${compact(d.volumeUsd)} vol` : `D+${n} pending`);
-  return <>{day(post.d1, 1)}<div className="sub">{day(post.d7, 7)}</div></>;
+  const day = (d: PoolDay, n: number) => d && `D+${n} $${compact(d.liquidityUsd)} liq${d.volumeUsd == null ? "" : ` · $${compact(d.volumeUsd)} vol`}`;
+  const days = [day(post.d1, 1), day(post.d7, 7)].filter(Boolean).join(" · ");
+  return (
+    <>
+      {post.current ? `$${compact(post.current.liquidityUsd)} liquidity now` : "–"}
+      {days && <div className="sub">{days}</div>}
+    </>
+  );
 }
 
+type Month = {
+  month: string; pools: number; factoryPools: number; contestedPools: number; unverifiedPools: number;
+  graduations: number; factoryGraduations: number; contestedGraduations: number; unverifiedGraduations: number;
+};
+
+// Monthly counts by verdict; `factory*` is the API's name for uncontested.
+const byVerdict = (m: Month, kind: "pools" | "graduations") =>
+  kind === "pools"
+    ? { all: m.pools, contested: m.contestedPools, unverified: m.unverifiedPools, uncontested: m.factoryPools }
+    : { all: m.graduations, contested: m.contestedGraduations, unverified: m.unverifiedGraduations, uncontested: m.factoryGraduations };
+
 function Integrity() {
-  const poll = usePoll<any[]>("/api/integrity/monthly", 300_000);
+  const poll = usePoll<Month[]>("/api/integrity/monthly", 300_000);
   const months = poll.data;
   const latest = months?.findLast((m) => m.graduations > 0);
   const toDate = latest?.month === new Date().toISOString().slice(0, 7);
-  const totalGraduations = months?.reduce((s, m) => s + m.graduations, 0) ?? 0;
-  const totalUncontested = months?.reduce((s, m) => s + m.factoryGraduations, 0) ?? 0;
-  const chart = (all: "pools" | "graduations", uncontested: "factoryPools" | "factoryGraduations", noun: string) =>
+  const total = (key: keyof Month) => months?.reduce((s, m) => s + (m[key] as number), 0) ?? 0;
+  const chart = (kind: "pools" | "graduations", noun: string) =>
     months?.length ? (
       <>
         <ColumnChart
           stacked series={VERDICTS} format={(v) => num(v, 0)} tickFormat={compact} height={220}
-          columns={months.map((m) => ({
-            label: monthLabel(m.month),
-            title: monthName(m.month),
-            values: [m[all] - m[uncontested], m[uncontested]],
-            detail: `${pct(m[all] ? m[uncontested] / m[all] : null, 1)} of ${noun} uncontested`,
-          }))}
+          columns={months.map((m) => {
+            const v = byVerdict(m, kind);
+            return {
+              label: monthLabel(m.month),
+              title: monthName(m.month),
+              values: [v.contested, v.unverified, v.uncontested],
+              detail: `${pct(v.all ? v.uncontested / v.all : null, 1)} of ${noun} uncontested`,
+            };
+          })}
         />
         <TableView
-          head={["Month", "Contested", "Uncontested", "Uncontested share"]}
-          rows={months.map((m) => [monthName(m.month), num(m[all] - m[uncontested], 0), num(m[uncontested], 0), pct(m[all] ? m[uncontested] / m[all] : null, 1)])}
+          head={["Month", "Contested", "Unverified", "Uncontested", "Uncontested share"]}
+          rows={months.map((m) => {
+            const v = byVerdict(m, kind);
+            return [monthName(m.month), num(v.contested, 0), num(v.unverified, 0), num(v.uncontested, 0), pct(v.all ? v.uncontested / v.all : null, 1)];
+          })}
         />
       </>
     ) : (
       <Placeholder poll={poll} empty="No history yet." height={248} />
     );
+  const month = latest && byVerdict(latest, "graduations");
+  const launches = latest && byVerdict(latest, "pools");
   return (
     <>
       <RawVsJudged />
       <div className="grid-even">
         <section className="card hero">
-          {latest ? (
+          {latest && month && launches ? (
             <>
               <div className="label">{monthName(latest.month)}{toDate ? ", month to date" : ""}</div>
               <div className="figure">
-                {num(latest.graduations - latest.factoryGraduations, 0)}<span> of {num(latest.graduations, 0)}</span>
+                {num(month.contested, 0)}<span> of {num(month.all, 0)}</span>
               </div>
               <p className="lede">
-                Meteora DBC graduations were contested: independent buyers competed to fill the curve. The other{" "}
-                {pct(latest.factoryGraduations / latest.graduations, 1)} completed without real competition.
+                Meteora DBC graduations were contested: independent buyers competed to fill the curve. {share(month.uncontested / month.all)} completed
+                without real competition, and {num(month.unverified, 0)} are unverified: no rule fired, but their transactions haven't been replayed yet.
               </p>
-              <p className="muted">
+              <StackBar parts={[
+                { label: "Contested", value: month.contested, color: VERDICTS[0].color },
+                { label: "Unverified", value: month.unverified, color: VERDICTS[1].color },
+                { label: "Uncontested", value: month.uncontested, color: VERDICTS[2].color },
+              ]} />
+              <p className="muted spaced">
                 Raw chain stats, DefiLlama and Meteora's DBC API count every completed curve. Litmus judges each one since April 2025 from on-chain
                 evidence and links the transactions, so launchpads and templates can be compared on contested outcomes.
               </p>
               <div className="tiles inset">
                 <Tile
-                  label="Contested since April 2025" value={pct((totalGraduations - totalUncontested) / totalGraduations, 1)}
-                  sub={`${compact(totalGraduations - totalUncontested)} of ${compact(totalGraduations)} graduations`}
+                  label="Uncontested since April 2025" value={share(total("factoryGraduations") / total("graduations"))}
+                  sub={`${compact(total("factoryGraduations"))} of ${compact(total("graduations"))} graduations`}
                 />
                 <Tile
-                  label="Contested launches this month" value={pct(latest.pools ? (latest.pools - latest.factoryPools) / latest.pools : null, 1)}
-                  sub={`${compact(latest.pools - latest.factoryPools)} of ${compact(latest.pools)} pools`}
+                  label="Contested launches this month" value={share(launches.all ? launches.contested / launches.all : null)}
+                  sub={`${num(launches.contested, 0)} of ${compact(launches.all)} · ${compact(launches.unverified)} unverified`}
                 />
               </div>
+              <AfterGraduation />
             </>
           ) : (
             <Placeholder poll={poll} empty="No graduations recorded yet." height={220} />
@@ -580,16 +666,50 @@ function Integrity() {
       <div className={poll.stale ? "grid-even stale" : "grid-even"}>
         <section className="card">
           <h2>Graduations per month</h2>
-          <p className="caption">Contested vs uncontested, since DBC went live in April 2025.</p>
-          {chart("graduations", "factoryGraduations", "graduations")}
+          <p className="caption">By verdict, since DBC went live in April 2025. Unverified: no rule fired and the transactions aren't replayed yet.</p>
+          {chart("graduations", "graduations")}
         </section>
         <section className="card">
           <h2>Launches per month</h2>
           <p className="caption">New pools by verdict. A pool is uncontested when its setup or creation slot left no room for competition.</p>
-          {chart("pools", "factoryPools", "launches")}
+          {chart("pools", "launches")}
         </section>
       </div>
     </>
+  );
+}
+
+// Post-graduation outcomes by verdict: a real market keeps liquidity in its DAMM v2 pool, an uncontested fill rarely does.
+type Outcome = { graduated: number; lpPulled: number; holding: number; d7: { graduated: number; alive: number } | null };
+type Outcomes = { window: number; aliveLiquidityUsd: number; contested: Outcome; uncontested: Outcome; unverified: Outcome };
+
+function AfterGraduation() {
+  const poll = usePoll<Outcomes>("/api/integrity/postgrad", 300_000);
+  const p = poll.data;
+  if (!p?.contested?.graduated || !p.uncontested?.graduated) return null;
+  const [c, u] = [p.contested, p.uncontested];
+  const alive = `$${num(p.aliveLiquidityUsd, 0)}`;
+  const metrics = [
+    { label: "LP pulled", of: (o: Outcome) => o.lpPulled / o.graduated },
+    { label: `Holding ${alive}+`, of: (o: Outcome) => o.holding / o.graduated },
+    ...(c.d7?.graduated && u.d7?.graduated ? [{ label: "Alive at 7d", of: (o: Outcome) => o.d7!.alive / o.d7!.graduated }] : []),
+  ];
+  return (
+    <div className="after">
+      <h2>After graduation</h2>
+      <p className="lede">
+        <b>{share(c.holding / c.graduated)}</b> of contested graduations still hold at least {alive} of liquidity in their DAMM v2 pool.{" "}
+        <b>{share(u.holding / u.graduated)}</b> of uncontested ones do.
+      </p>
+      <p className="caption">
+        Graduations in the last {num(p.window / 86400, 0)} days whose DAMM v2 pool Litmus has read: {num(c.graduated, 0)} contested, {num(u.graduated, 0)} uncontested.
+      </p>
+      <ColumnChart
+        series={[VERDICTS[0], VERDICTS[2]]} max={1} format={share} tickFormat={(v) => pct(v)} height={180}
+        columns={metrics.map((m) => ({ label: m.label, values: [m.of(c), m.of(u)] }))}
+      />
+      <TableView head={["", "Contested", "Uncontested"]} rows={metrics.map((m) => [m.label, share(m.of(c)), share(m.of(u))])} />
+    </div>
   );
 }
 
@@ -598,10 +718,10 @@ const SPLIT_ROWS = 7;
 
 // The demo's centerpiece: each graduation as raw chain stats count it (left) and as Litmus judges it (right).
 function RawVsJudged() {
-  const { items, recent } = useGraduations();
+  const { items, recent } = useGraduations(useFeed());
   useTick(5000);
-  const contested = items.filter((g) => contestedOf(g) === true).length;
-  const uncontested = items.filter((g) => contestedOf(g) === false).length;
+  const count = (v: Verdict) => items.filter((g) => verdictOf(g) === v).length;
+  const [contested, unverified, uncontested] = [count("contested"), count("unverified"), count("uncontested")];
   const since = items.at(-1)?.ts;
   return (
     <section className="card split">
@@ -619,13 +739,13 @@ function RawVsJudged() {
         <div className="split-count">
           <div className="label">Litmus verdict</div>
           <div className="count">{num(contested, 0)}<span> contested</span></div>
-          <div className="sub">{num(uncontested, 0)} uncontested{items.length ? ` · ${pct(contested / items.length, 1)} contested` : ""}</div>
+          <div className="sub">{num(uncontested, 0)} uncontested · {num(unverified, 0)} unverified</div>
         </div>
       </div>
       {items.length ? (
         <ol className="split-rows" aria-label="Latest graduations, raw and judged">
           {items.slice(0, SPLIT_ROWS).map((g) => (
-            <li key={`${g.sig}-${g.pool}`} className={[contestedOf(g) && "contested", g.fresh && "fresh"].filter(Boolean).join(" ")}>
+            <li key={`${g.sig}-${g.pool}`} className={[verdictOf(g) === "contested" && "contested", g.fresh && "fresh"].filter(Boolean).join(" ")}>
               <div className="raw">
                 <div className="name-row">
                   <span className="dot" style={{ background: "var(--good)" }} />
@@ -667,8 +787,9 @@ function Rules() {
     <section className="card">
       <h2>How a graduation is judged</h2>
       <p className="caption">
-        Contested: independent buyers competed to fill the curve. Uncontested: it was completed without real competition. A verdict keeps the rules
-        that matched as evidence, with the transactions behind them.{poll.data ? ` Rules version ${poll.data.version}.` : ""}
+        Contested: independent buyers competed to fill the curve. Uncontested: a rule fired, the curve was completed without real competition.
+        Unverified: no rule fired, but the transactions that would confirm competition haven't been replayed yet. A verdict keeps the rules that
+        matched as evidence, with the transactions behind them.{poll.data ? ` Rules version ${poll.data.version}.` : ""}
       </p>
       {poll.data ? (
         <dl className="signals">
@@ -687,16 +808,17 @@ function Rules() {
 }
 
 const ENDPOINTS = [
-  ["GET /api/overview?window=86400", "Launches, graduations and active pools in the window (seconds), the contested subset (organic), volume per quote token, SOL/USD."],
-  ["GET /api/integrity/monthly", "Every month since April 2025: pools and graduations, and how many of each were uncontested (factoryPools, factoryGraduations)."],
+  ["GET /api/overview?window=86400", "Launches, graduations and active pools in the window (seconds): contested counts, organic (not judged uncontested: contested + unverified), volume per quote token, SOL/USD."],
+  ["GET /api/integrity/monthly", "Every month since April 2025: pools and graduations by verdict (contestedPools, unverifiedPools, factoryPools = uncontested; the same for graduations)."],
   ["GET /api/graduations/recent?limit=50", "Latest judged graduations, in the same shape as stream items: verdict, evidence, receipts, launchpad."],
   ["GET /api/rules", "The versioned rules behind every verdict: id, name, description, threshold."],
   ["GET /api/launchpads?window=86400", "Launchpads by identity address with all-time contested outcomes, activity in the window and uncontested share. name is null when unlabeled."],
-  ["GET /api/templates?window=86400&organic=1", "Parameter templates with graduation rate, contested graduation rate, median time to graduate, launchpad and template prior. organic=1 drops uncontested templates."],
+  ["GET /api/templates?window=86400&organic=1", "Parameter templates with graduation rate, graduation rate excluding uncontested pools (organicGradRate), median time to graduate, launchpad and template prior. organic=1 drops uncontested templates."],
   ["GET /api/templates/:id", "One template: configs with sampled bonding curves, graduation odds by progress, recent launches with verdicts."],
+  ["GET /api/pools/:address", "One pool with its verdict, evidence, signals, receipts, launchpad and post-graduation outcome."],
   ["GET /api/configs/:address", "Any config, decoded from chain on first request: parameters, curve, supply split, template, launchpad, pools."],
   ["GET /api/pools/hot", "Pools closest to graduation right now, with empirical odds, verdict, evidence and launchpad."],
-  ["GET /api/benchmarks/similar?quote=SOL&threshold=85", "Outcome priors: every pool with a similar migration threshold since April 2025, all vs contested, by threshold bucket."],
+  ["GET /api/benchmarks/similar?quote=SOL&threshold=85", "Outcome priors: every pool with a similar migration threshold since April 2025, all vs uncontested excluded, by threshold bucket."],
   ["GET /api/health", "Stream transport, updates received, last slot."],
   ["GET /api/usage", "Requests per route per day, stream subscribers, Studio deploys and launches."],
   ["WS /api/stream", "Push feed of launches, graduations and new configs as they land, each with verdict, evidence, receipts and launchpad."],
@@ -711,15 +833,17 @@ const STREAM_ITEM = `type StreamItem = {
   mint?: string; creator?: string; name?: string; symbol?: string; uri?: string; // launch
   quoteReserve?: string;                     // graduation, raw quote amount
   feeClaimer?: string; quoteMint?: string;   // config
-  contested: boolean;  // false: completed without real competition
+  verdict: "contested" | "uncontested" | "unverified";
+  contested: boolean | null; // null: unverified (no rule fired, transactions not replayed yet)
   evidence: Record<string, string>; // e.g. { "creator fill": "94% in the creation slot" }
+  signals: { creatorFillPct, creationSlotFillPct, distinctBuyers, nonCreatorVolumePct, sameSlotCompletion, thresholdQuote } | null;
   receipts: string[];  // transaction signatures backing the evidence
   launchpad: { id: string; name: string | null } | null;
-  organic: boolean; reasons: string[];       // v2 aliases of contested and evidence
+  organic: boolean; reasons: string[];       // v2 aliases: organic = not uncontested
 };`;
 
 function ApiDocs() {
-  const origin = location.origin;
+  const origin = source.base || location.origin;
   return (
     <section className="card">
       <h2>Data API</h2>
@@ -734,7 +858,7 @@ function ApiDocs() {
             <div key={route}>
               <dt className="mono">
                 <span className="badge">{method}</span>{" "}
-                {method === "GET" && !path.includes(":") ? <a href={path} target="_blank" rel="noreferrer">{path}</a> : path}
+                {method === "GET" && !path.includes(":") ? <a href={apiUrl(path)} target="_blank" rel="noreferrer">{path}</a> : path}
               </dt>
               <dd>{what}</dd>
             </div>
