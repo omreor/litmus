@@ -8,11 +8,11 @@ import { apiUrl, source, useFeed, useGraduations, usePoll, useTick, verdictOf, t
 import { Studio, type Fork } from "./studio";
 
 const SERIES_COLORS = ["var(--s1)", "var(--s2)", "var(--s3)"];
-// Stacked in this order; the three colors pass the dataviz palette validator as adjacent pairs on the dark surface.
+// Stacked in this order (see the verdict colors in styles.css).
 const VERDICTS = [
-  { name: "Contested", color: "var(--s1)" },
-  { name: "Unverified", color: "var(--s3)" },
-  { name: "Uncontested", color: "var(--s2)" },
+  { name: "Contested", color: "var(--contested)" },
+  { name: "Unverified", color: "var(--unverified)" },
+  { name: "Uncontested", color: "var(--uncontested)" },
 ];
 const WINDOWS = [
   { label: "1h", seconds: 3600 },
@@ -21,7 +21,7 @@ const WINDOWS = [
   { label: "7d", seconds: 7 * 86400 },
   { label: "30d", seconds: 30 * 86400 },
 ];
-const TABS = { radar: "Radar", launchpads: "Launchpads", templates: "Templates", integrity: "Integrity", studio: "Studio", api: "API" };
+const TABS = { integrity: "Integrity", radar: "Radar", launchpads: "Launchpads", templates: "Templates", studio: "Studio", api: "API" };
 type Tab = keyof typeof TABS;
 const TITLES: Record<Tab, string> = {
   radar: "Live radar", launchpads: "Launchpad leaderboard", templates: "Templates", integrity: "Raw vs judged graduations",
@@ -30,6 +30,8 @@ const TITLES: Record<Tab, string> = {
 // Below this many pools a rate is noise: it's shown as "–" or ranked last.
 const MIN_SAMPLE = 20;
 const ODDS_SAMPLE = 5;
+// Launchpads with at least this share of pools judged uncontested can be hidden from the leaderboard.
+const UNCONTESTED_PAD = 0.99;
 
 // Sub-1 amounts keep two significant digits: a 0.00001 SOL threshold must not read as 0.
 const amount = (v: number) => (v >= 10_000 ? compact(v) : v >= 1 ? num(v, 2) : v.toLocaleString("en", { maximumSignificantDigits: 2 }));
@@ -39,13 +41,14 @@ const share = (x: number | null) => (x != null && x > 0 && x < 0.001 ? `${(x * 1
 
 const tabFromHash = () => {
   const hash = location.hash.slice(1);
-  return (Object.hasOwn(TABS, hash) ? hash : "radar") as Tab;
+  return (Object.hasOwn(TABS, hash) ? hash : "integrity") as Tab;
 };
 
 function App() {
   const [tab, setTab] = useState(tabFromHash);
   const [windowSeconds, setWindowSeconds] = useState(86400);
   const [hideUncontested, setHideUncontested] = useState(true);
+  const [hideUncontestedPads, setHideUncontestedPads] = useState(false);
   const [fork, setFork] = useState<Fork | null>(null);
   const health = usePoll<any>("/api/health", 5000).data;
   const live = health && Date.now() - health.lastUpdateAt < 15_000;
@@ -63,7 +66,7 @@ function App() {
   return (
     <div className="shell">
       <header className="top">
-        <a className="brand" href="#radar">Litmus <small>the truth layer for Meteora DBC launches</small></a>
+        <a className="brand" href="#integrity">Litmus <small>the truth layer for Meteora DBC launches</small></a>
         <nav className="tabs" aria-label="Sections">
           {Object.entries(TABS).map(([id, label]) => (
             <a key={id} href={`#${id}`} aria-current={tab === id ? "page" : undefined}>{label}</a>
@@ -93,17 +96,23 @@ function App() {
               <button key={w.label} aria-pressed={windowSeconds === w.seconds} onClick={() => setWindowSeconds(w.seconds)}>{w.label}</button>
             ))}
           </div>
-          {tab !== "launchpads" && (
+          {tab === "launchpads" ? (
+            <label className="check">
+              <input type="checkbox" checked={hideUncontestedPads} onChange={(e) => setHideUncontestedPads(e.target.checked)} />
+              Hide launchpads with {pct(UNCONTESTED_PAD)}+ uncontested pools
+            </label>
+          ) : (
             <label className="check">
               <input type="checkbox" checked={hideUncontested} onChange={(e) => setHideUncontested(e.target.checked)} />
               Hide uncontested
             </label>
           )}
+          <VerdictLegend />
         </div>
       )}
       <Boundary key={tab}>
         {tab === "radar" && <Radar windowSeconds={windowSeconds} hideUncontested={hideUncontested} />}
-        {tab === "launchpads" && <Launchpads windowSeconds={windowSeconds} />}
+        {tab === "launchpads" && <Launchpads windowSeconds={windowSeconds} hideUncontested={hideUncontestedPads} />}
         {tab === "templates" && (
           <Templates
             windowSeconds={windowSeconds} hideUncontested={hideUncontested}
@@ -135,14 +144,28 @@ class Boundary extends Component<{ children: ReactNode }, { error: string | null
   }
 }
 
-const VERDICT_TEXT: Record<Verdict, { label: string; caption: string }> = {
-  contested: { label: "Contested", caption: "Independent buyers competed to fill the curve." },
-  uncontested: { label: "Uncontested", caption: "A rule fired: the curve was set up or filled without real competition." },
+const VERDICT_TEXT: Record<Verdict, { label: string; short: string; caption: string }> = {
+  contested: { label: "Contested", short: "independent buyers competed to fill the curve", caption: "Independent buyers competed to fill the curve." },
+  uncontested: {
+    label: "Uncontested", short: "the curve filled without real competition",
+    caption: "The curve filled without real competition: for example most of it was bought at launch by the creator, or its settings complete it on a tiny buy.",
+  },
   unverified: {
-    label: "Unverified",
-    caption: "No rule fired, but competition isn't confirmed: that takes independent buyers seen in its transactions from creation.",
+    label: "Unverified", short: "trades not checked yet",
+    caption: "Nothing so far points to an uncontested fill, but Litmus hasn't checked this pool's trades from launch yet, so competition isn't confirmed.",
   },
 };
+
+// One-line key for the three verdicts, where they first appear on a view.
+function VerdictLegend() {
+  return (
+    <p className="verdict-legend">
+      {(["contested", "unverified", "uncontested"] as const).map((v) => (
+        <span key={v}><span className={`dot ${v}`} /><span><b>{VERDICT_TEXT[v].label}</b>: {VERDICT_TEXT[v].short}</span></span>
+      ))}
+    </p>
+  );
+}
 
 // Evidence as display lines; v2 `reasons` / `factoryReasons` stand in when a payload has no evidence yet.
 const evidenceOf = (x: Judged) =>
@@ -163,7 +186,7 @@ function Verdict({ of: x, prior = false }: { of: Judged; prior?: boolean }) {
         <h3>{label}</h3>
         <p className="caption">
           {prior
-            ? "Template prior: pools on these parameters complete without real competition. Each pool is still judged on its own evidence."
+            ? "From this template's history: pools on these settings usually fill without real competition. Each pool is still judged on its own evidence."
             : caption}
         </p>
         {evidence.length > 0 ? <ul>{evidence.map((e) => <li key={e}>{e}</li>)}</ul> : <p className="muted">No evidence attached.</p>}
@@ -189,7 +212,11 @@ function Radar({ windowSeconds, hideUncontested }: { windowSeconds: number; hide
   const feed = [...live.filter((i) => i.type !== "graduation"), ...useGraduations(live).items].sort((a, b) => b.ts - a.ts).slice(0, 60);
   const overview = overviewPoll.data;
   const notUncontested = (x: Judged) => verdictOf(x) !== "uncontested";
-  const hot = hideUncontested ? hotPoll.data?.filter(notUncontested) : hotPoll.data;
+  // Judged pools first, each group still by progress (the API's order).
+  const hot = (hideUncontested ? hotPoll.data?.filter(notUncontested) : hotPoll.data)?.toSorted(
+    (a, b) => Number(verdictOf(a) === "unverified") - Number(verdictOf(b) === "unverified"),
+  );
+  const mostlyUnverified = !!hot?.length && hot.filter((p) => verdictOf(p) === "unverified").length > hot.length / 2;
   const items = hideUncontested ? feed.filter(notUncontested) : feed;
   const hasOdds = hot?.some((p) => p.odds);
   const solVolume = overview?.volume.find((v: any) => v.mint === SOL_MINT);
@@ -229,9 +256,14 @@ function Radar({ windowSeconds, hideUncontested }: { windowSeconds: number; hide
         <section className="card">
           <h2>Closest to graduation</h2>
           <p className="caption">
-            Pools traded in the last 10 minutes, by progress to their own migration threshold.
+            Pools traded in the last 10 minutes, by progress to their own migration threshold, judged pools first.
             {hasOdds ? " Odds: how often pools of the same template that got this far went on to graduate." : ""}
           </p>
+          {mostlyUnverified && (
+            <p className="note">
+              Most of these are unverified: Litmus hasn't checked their trades from launch yet, so it can't confirm competition either way.
+            </p>
+          )}
           <div className="table-scroll live">
             <table>
               <thead>
@@ -271,7 +303,7 @@ function Radar({ windowSeconds, hideUncontested }: { windowSeconds: number; hide
           <ul className="feed">
             {items.map((item) => (
               <li key={`${item.sig}-${item.type}-${item.pool ?? item.config}`}>
-                <span className="dot" style={{ background: { launch: "var(--text-2)", graduation: "var(--good)", config: "var(--muted)" }[item.type] }} />
+                <span className={`dot ${item.type === "config" ? "ring" : verdictOf(item) ?? "ring"}`} />
                 <div className="what">
                   <div className="kind">
                     {{ launch: "Launch", graduation: "Graduated", config: "New config" }[item.type]}
@@ -322,19 +354,24 @@ function Alive7d({ post }: { post?: { graduated: number; aliveD7: number } | nul
   return <>{pct(post.aliveD7 / post.graduated, 1)}<div className="sub">of {num(post.graduated, 0)}</div></>;
 }
 
-function Launchpads({ windowSeconds }: { windowSeconds: number }) {
+// Contested graduations in the window when the API has them, else all-time; then graduations with uncontested ones excluded.
+const contestedIn = (l: any) => l.window.contestedGraduations ?? l.allTime.contestedGraduations ?? 0;
+const byContestedGraduations = (a: any, b: any) =>
+  contestedIn(b) - contestedIn(a) || b.window.organicGraduations - a.window.organicGraduations || b.allTime.organicGraduations - a.allTime.organicGraduations;
+
+function Launchpads({ windowSeconds, hideUncontested }: { windowSeconds: number; hideUncontested: boolean }) {
   const poll = usePoll<any[]>(`/api/launchpads?window=${windowSeconds}`, 30_000);
-  const rows = poll.data?.toSorted(
-    (a, b) => b.window.organicGraduations - a.window.organicGraduations || b.allTime.organicGraduations - a.allTime.organicGraduations,
-  );
+  const all = poll.data?.toSorted(byContestedGraduations);
+  const rows = hideUncontested ? all?.filter((l) => l.factoryShare < UNCONTESTED_PAD) : all;
+  const windowed = rows?.some((l) => l.window.contestedGraduations != null);
   const hasPost = hasAlive7d(rows);
   return (
     <section className="card">
       <h2>Launchpad leaderboard</h2>
       <p className="caption">
-        Ranked by graduations in the window with uncontested ones excluded: contested plus unverified (no rule fired, transactions not replayed yet).
-        Launchpads are identified from on-chain partner metadata, Jupiter's launchpad labels and the wallets behind their configs. Contested
-        graduations, graduation rate and median time to graduate are all-time since April 2025, the last two with uncontested pools excluded
+        Ranked by contested graduations{windowed ? " in the window" : " since April 2025"}. Launchpads are identified from on-chain partner metadata,
+        Jupiter's launchpad labels and the wallets behind their configs; one without a public name shows as "Unlabeled launchpad" and its address.
+        Graduation rate and median time to graduate are all-time, with uncontested pools left out
         {hasPost ? "; alive at 7d is the share of graduated pools whose DAMM v2 pool still had liquidity and volume a week later" : ""}.
         Uncontested share: the launchpad's pools <a href="#integrity">judged uncontested</a>.
       </p>
@@ -342,8 +379,8 @@ function Launchpads({ windowSeconds }: { windowSeconds: number }) {
         <table>
           <thead>
             <tr>
-              <th className="num wide">#</th><th>Launchpad</th><th className="num">Graduations excl. uncontested</th>
-              <th className="num wide">Launches excl. uncontested</th><th className="num wide">Contested graduations, all-time</th>
+              <th className="num wide">#</th><th>Launchpad</th><th className="num">Contested graduations{windowed ? "" : ", all-time"}</th>
+              <th className="num wide">Graduations excl. uncontested</th><th className="num wide">Launches excl. uncontested</th>
               <th className="num wide">Grad rate excl. uncontested</th>{hasPost && <th className="num">Alive at 7d</th>}<th className="num wide">Pools, all-time</th>
               <th className="num wide">Median time to graduate</th><th className="num">Uncontested share</th>
             </tr>
@@ -353,9 +390,9 @@ function Launchpads({ windowSeconds }: { windowSeconds: number }) {
               <tr key={l.id}>
                 <td className="num muted wide">{i + 1}</td>
                 <td><LaunchpadCell launchpad={l} /></td>
-                <td className="num"><b>{num(l.window.organicGraduations, 0)}</b><div className="sub">of {num(l.window.graduations, 0)}</div></td>
+                <td className="num"><b>{num(contestedIn(l), 0)}</b></td>
+                <td className="num wide">{num(l.window.organicGraduations, 0)}<div className="sub">of {num(l.window.graduations, 0)}</div></td>
                 <td className="num wide">{num(l.window.organicLaunches, 0)}<div className="sub">of {num(l.window.launches, 0)}</div></td>
-                <td className="num wide">{num(l.allTime.contestedGraduations ?? 0, 0)}</td>
                 <td className="num wide">
                   {l.allTime.organicPools >= MIN_SAMPLE ? pct(l.allTime.organicGraduations / l.allTime.organicPools, 1) : "–"}
                   <div className="sub">of {num(l.allTime.organicPools, 0)}</div>
@@ -363,7 +400,7 @@ function Launchpads({ windowSeconds }: { windowSeconds: number }) {
                 {hasPost && <td className="num"><Alive7d post={l.postGraduation} /></td>}
                 <td className="num wide">{num(l.allTime.pools, 0)}</td>
                 <td className="num wide">{duration(l.allTime.medianSecondsToGraduate)}</td>
-                <td className="num">{pct(l.factoryShare, 1)}</td>
+                <td className="num">{share(l.factoryShare)}</td>
               </tr>
             ))}
           </tbody>
@@ -379,13 +416,9 @@ function LaunchpadCell({ launchpad }: { launchpad: { id: string; name: string | 
   return (
     <div className="token">
       <a href={`https://solscan.io/account/${launchpad.id}`} target="_blank" rel="noreferrer">
-        <b dir="auto" className={launchpad.name ? undefined : "mono"}>{launchpadName(launchpad)}</b>
+        <b dir="auto">{launchpad.name ?? "Unlabeled launchpad"}</b>
       </a>
-      <span>
-        {website ? (
-          <a href={website} target="_blank" rel="noreferrer">{website.slice(8).split("/")[0]}</a>
-        ) : launchpad.name ? short(launchpad.id) : "unlabeled"}
-      </span>
+      <span>{website ? <a href={website} target="_blank" rel="noreferrer">{website.slice(8).split("/")[0]}</a> : short(launchpad.id)}</span>
     </div>
   );
 }
@@ -412,9 +445,9 @@ function Templates({ windowSeconds, hideUncontested, onFork }: { windowSeconds: 
         <h2>Templates</h2>
         <p className="caption">
           Configs grouped by parameter template: quote, threshold, fees, LP split and migration. Launchpads mint a config per token, so the
-          template is the real preset. Ranked by graduation rate with uncontested pools set aside (contested plus unverified pools); templates with
-          under {MIN_SAMPLE} pools in the window come last. Median time to graduate excludes uncontested graduations. A template's Uncontested badge
-          is a prior from its history: each pool is still judged on its own evidence.
+          template is the real preset. Ranked by graduation rate with uncontested pools left out; templates with under {MIN_SAMPLE} pools in the
+          window come last. Median time to graduate leaves out uncontested graduations. A template's Uncontested badge comes from its history:
+          each pool is still judged on its own evidence.
         </p>
         <div className={poll.stale ? "table-scroll stale" : "table-scroll"}>
           <table>
@@ -434,7 +467,7 @@ function Templates({ windowSeconds, hideUncontested, onFork }: { windowSeconds: 
                         <button className="link" aria-pressed={t === current}><b>{t.label}</b></button>
                         <Verdict of={t} prior />
                       </div>
-                      <span>{presetLabel(t.shape)}</span>
+                      <span>{presetLabel(t.shape, t.quote.symbol)}</span>
                     </div>
                   </td>
                   <td className="wide">{t.launchpad ? launchpadName(t.launchpad) : <span className="muted">–</span>}</td>
@@ -486,7 +519,7 @@ function TemplateDetail({ detail, row, onFork }: { detail: any; row: any; onFork
               {duration(row.medianSecondsToGraduate)} to graduate, uncontested excluded
             </p>
           </div>
-          <button className="btn" onClick={() => onFork({ address: lead.address, label: detail.label, info })}>Fork with priors</button>
+          <button className="btn" onClick={() => onFork({ address: lead.address, label: detail.label, info, quoteSymbol: row.quote?.symbol })}>Fork with priors</button>
         </div>
       </section>
       <section className="card">
@@ -619,6 +652,7 @@ function Integrity() {
     ) : (
       <Placeholder poll={poll} empty="No history yet." height={248} />
     );
+  const firstContested = months?.find((m) => m.contestedGraduations > 0)?.month;
   const month = latest && byVerdict(latest, "graduations");
   const launches = latest && byVerdict(latest, "pools");
   return (
@@ -634,7 +668,7 @@ function Integrity() {
               </div>
               <p className="lede">
                 Meteora DBC graduations were contested: independent buyers competed to fill the curve. {share(month.uncontested / month.all)} completed
-                without real competition, and {num(month.unverified, 0)} are unverified: no rule fired, but their transactions haven't been replayed yet.
+                without real competition, and {num(month.unverified, 0)} are unverified: their trades haven't been checked yet.
               </p>
               <StackBar parts={[
                 { label: "Contested", value: month.contested, color: VERDICTS[0].color },
@@ -666,12 +700,15 @@ function Integrity() {
       <div className={poll.stale ? "grid-even stale" : "grid-even"}>
         <section className="card">
           <h2>Graduations per month</h2>
-          <p className="caption">By verdict, since DBC went live in April 2025. Unverified: no rule fired and the transactions aren't replayed yet.</p>
+          <p className="caption">
+            By verdict, since DBC went live in April 2025. Confirming a contested graduation takes the pool's trades from launch; Litmus has them for
+            graduations {firstContested ? `since ${monthName(firstContested)}` : "from its live stream"}, so earlier ones that aren't uncontested stay unverified.
+          </p>
           {chart("graduations", "graduations")}
         </section>
         <section className="card">
           <h2>Launches per month</h2>
-          <p className="caption">New pools by verdict. A pool is uncontested when its setup or creation slot left no room for competition.</p>
+          <p className="caption">New pools by verdict. A launch is uncontested when its settings or its first block left no room for competition.</p>
           {chart("pools", "launches")}
         </section>
       </div>
@@ -730,6 +767,7 @@ function RawVsJudged() {
         Every DBC graduation as it lands: first as raw chain stats, DefiLlama and Meteora's DBC API count it, then as Litmus judges it, with its
         evidence and transactions.
       </p>
+      <VerdictLegend />
       <div className="split-grid">
         <div className="split-count">
           <div className="label">Raw chain stats</div>
@@ -748,7 +786,7 @@ function RawVsJudged() {
             <li key={`${g.sig}-${g.pool}`} className={[verdictOf(g) === "contested" && "contested", g.fresh && "fresh"].filter(Boolean).join(" ")}>
               <div className="raw">
                 <div className="name-row">
-                  <span className="dot" style={{ background: "var(--good)" }} />
+                  <span className="dot ring" />
                   <span className="kind">Graduated</span>
                   <b dir="auto">{g.name || short(g.pool ?? g.sig)}</b>
                 </div>
@@ -787,9 +825,9 @@ function Rules() {
     <section className="card">
       <h2>How a graduation is judged</h2>
       <p className="caption">
-        Contested: independent buyers competed to fill the curve. Uncontested: a rule fired, the curve was completed without real competition.
-        Unverified: no rule fired, but the transactions that would confirm competition haven't been replayed yet. A verdict keeps the rules that
-        matched as evidence, with the transactions behind them.{poll.data ? ` Rules version ${poll.data.version}.` : ""}
+        A graduation is uncontested when any of these checks matches, contested when its trades from launch show independent buyers and none
+        matches, and unverified until its trades are checked. Every verdict lists the checks that matched and links the transactions behind
+        them.{poll.data ? ` Rules version ${poll.data.version}.` : ""}
       </p>
       {poll.data ? (
         <dl className="signals">

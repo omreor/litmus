@@ -275,11 +275,11 @@ export function Tile({ label, value, sub }: { label: string; value: string; sub?
   );
 }
 
-export function Meter({ value, near = 0.9 }: { value: number; near?: number }) {
+export function Meter({ value }: { value: number }) {
   const v = Math.max(0, Math.min(value, 1));
   return (
     <div className="meter" role="meter" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(v * 100)}>
-      <div className="track"><div className={v >= near ? "fill near" : "fill"} style={{ width: `${v * 100}%` }} /></div>
+      <div className="track"><div className="fill" style={{ width: `${v * 100}%` }} /></div>
       <span>{(v * 100).toFixed(0)}%</span>
     </div>
   );

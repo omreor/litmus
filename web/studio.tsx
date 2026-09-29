@@ -1,10 +1,19 @@
 import { useEffect, useState } from "react";
 import { ColumnChart, LineChart, Placeholder, StackBar, TableView, Tile, type Series } from "./charts";
-import { compact, duration, num, pct, short, SOL_MINT } from "./format";
+import { compact, duration, feeLabel, lpLabel, num, pct, quoteSymbol, short, SOL_MINT } from "./format";
 import { apiUrl, usePoll } from "./hooks";
 import { DeployPanel } from "./deploy";
 
-export type Fork = { address: string; label: string; info: any; stats?: { pools: number; graduated: number; contestedGraduated: number } };
+export type Fork = {
+  address: string; label: string; info: any; quoteSymbol?: string | null;
+  stats?: { pools: number; graduated: number; contestedGraduated: number };
+};
+
+// The Studio designs SOL and USDC curves only; a config quoted in anything else is shown as it is, never converted.
+const studioQuote = (mint: string) => {
+  const symbol = quoteSymbol(mint);
+  return symbol === "SOL" || symbol === "USDC" ? symbol : null;
+};
 
 export type StudioInput = {
   quote: "SOL" | "USDC";
@@ -35,12 +44,12 @@ const DEFAULT_INPUT: StudioInput = {
 const POOL_FEES = [25, 30, 100, 200, 400, 600];
 const round = (x: number, digits = 2) => Math.round(x * 10 ** digits) / 10 ** digits;
 
-// Map a decoded on-chain config onto Studio inputs.
+// Map a decoded on-chain SOL- or USDC-quoted config onto Studio inputs.
 function fromConfig(info: any): StudioInput {
   const s = info.shape;
   return {
     ...DEFAULT_INPUT,
-    quote: s.quoteMint === SOL_MINT ? "SOL" : "USDC",
+    quote: studioQuote(s.quoteMint) ?? DEFAULT_INPUT.quote,
     tokenType: s.tokenType,
     supply: s.supply,
     initialMcap: round(info.initialMcap),
@@ -77,13 +86,19 @@ function NumberInput({ value, onChange, step = 1, min = 0 }: { value: number; on
 
 export function Studio({ seed }: { seed: Fork | null }) {
   const [fork, setFork] = useState(seed);
-  const [input, setInput] = useState<StudioInput>(() => (seed ? fromConfig(seed.info) : DEFAULT_INPUT));
+  const [input, setInput] = useState<StudioInput>(() => (seed && studioQuote(seed.info.shape.quoteMint) ? fromConfig(seed.info) : DEFAULT_INPUT));
+  // A fork from the Templates tab carries no outcomes or quote symbol: the config's detail fills them in.
+  const detail = usePoll<any>(fork && !fork.stats ? `/api/configs/${fork.address}` : null, 300_000).data;
+  const forked = fork && { ...fork, stats: fork.stats ?? detail?.stats, quoteSymbol: fork.quoteSymbol ?? detail?.quote?.symbol };
+  const forkQuote = forked && studioQuote(forked.info.shape.quoteMint);
+  const readOnly = !!forked && !forkQuote;
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   const set = <K extends keyof StudioInput>(key: K) => (value: StudioInput[K]) => setInput((prev) => ({ ...prev, [key]: value }));
   const setLp = (key: keyof StudioInput["lp"]) => (value: number) => setInput((prev) => ({ ...prev, lp: { ...prev.lp, [key]: value } }));
 
   useEffect(() => {
+    if (readOnly) return;
     const id = setTimeout(async () => {
       try {
         const res = await fetch(apiUrl("/api/studio/build"), { method: "POST", body: JSON.stringify(input) });
@@ -97,22 +112,38 @@ export function Studio({ seed }: { seed: Fork | null }) {
       }
     }, 250);
     return () => clearTimeout(id);
-  }, [input]);
+  }, [input, readOnly]);
 
   const lpTotal = input.lp.partnerLocked + input.lp.partner + input.lp.creatorLocked + input.lp.creator;
   const series: Series[] = [];
   if (result) series.push({ name: "Your curve", color: "var(--s1)", points: result.curve.map((p: any) => ({ x: p.quote, y: p.mcap })) });
-  if (fork) series.push({ name: `Forked: ${fork.label}`, color: "var(--s2)", points: fork.info.curve.map((p: any) => ({ x: p.quote, y: p.mcap })) });
+  // The forked curve shares the chart only while both are in the same quote.
+  const sameQuote = forked && forkQuote === input.quote;
+  if (sameQuote) series.push({ name: `Forked: ${forked.label}`, color: "var(--s2)", points: forked.info.curve.map((p: any) => ({ x: p.quote, y: p.mcap })) });
   // Priors follow the last valid build, or the fork itself while the form doesn't build.
-  const priorsThreshold: number | undefined = result?.migrationThreshold ?? fork?.info.migrationThreshold;
+  const priorsThreshold: number | undefined = result?.migrationThreshold ?? (sameQuote ? forked.info.migrationThreshold : undefined);
   const loadFork = (f: Fork) => {
     setFork(f);
-    setInput(fromConfig(f.info));
+    if (studioQuote(f.info.shape.quoteMint)) setInput(fromConfig(f.info));
   };
+
+  if (forked && readOnly)
+    return (
+      <div className="studio">
+        <ForkBar fork={forked} onFork={loadFork} />
+        <ForeignFork
+          fork={forked}
+          onReset={() => {
+            setFork(null);
+            setInput(DEFAULT_INPUT);
+          }}
+        />
+      </div>
+    );
 
   return (
     <div className="studio">
-      <ForkBar fork={fork} onFork={loadFork} />
+      <ForkBar fork={forked} onFork={loadFork} />
       <section className="card form">
         <h2>Parameters</h2>
         <p className="caption">Loaded from the fork, or defaults. Every change is rebuilt with Meteora's DBC SDK and validated like the program would.</p>
@@ -238,7 +269,7 @@ function ForkBar({ fork, onFork }: { fork: Fork | null; onFork: (fork: Fork) => 
       const body = await res.json().catch(() => null);
       if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
       const label = body.launchpad?.name ? `${body.launchpad.name} ${short(trimmed)}` : short(trimmed);
-      onFork({ address: trimmed, label, info: body.info, stats: body.stats });
+      onFork({ address: trimmed, label, info: body.info, stats: body.stats, quoteSymbol: body.quote?.symbol });
       setStatus(null);
     } catch (e) {
       setStatus(`Couldn't load that config (${e instanceof Error ? e.message : e}).`);
@@ -267,13 +298,63 @@ function ForkBar({ fork, onFork }: { fork: Fork | null; onFork: (fork: Fork) => 
             Forked <a className="mono" href={`https://solscan.io/account/${fork.address}`} target="_blank" rel="noreferrer">{fork.label}</a>
             {fork.stats &&
               `: ${num(fork.stats.pools, 0)} pools, ${num(fork.stats.graduated, 0)} graduated, ${num(fork.stats.contestedGraduated, 0)} contested`}
-            . Its curve is drawn next to yours.
+            .{studioQuote(fork.info.shape.quoteMint) ? " Its curve is drawn next to yours." : ""}
           </>
         ) : (
           <>Try <button type="button" className="link" onClick={() => load(EXAMPLE.address)}>{EXAMPLE.label}</button>.</>
         ))}
       </p>
     </section>
+  );
+}
+
+// A fork the Studio can't redesign: its real curve and outcomes, in its own quote, read-only.
+function ForeignFork({ fork, onReset }: { fork: Fork; onReset: () => void }) {
+  const { info, stats } = fork;
+  const quote = fork.quoteSymbol ?? quoteSymbol(info.shape.quoteMint);
+  return (
+    <div className="studio-out span">
+      <section className="card full">
+        <h2>Read-only: this config is quoted in {quote}</h2>
+        <p className="note">
+          Studio can design SOL or USDC curves; this config is quoted in {quote}. Its real curve and outcomes are shown as they are, in {quote}, never
+          converted.
+        </p>
+        {stats && (
+          <div className="tiles inset">
+            <Tile label="Pools on this config" value={num(stats.pools, 0)} />
+            <Tile label="Completed their curve" value={num(stats.graduated, 0)} sub={stats.pools ? pct(stats.graduated / stats.pools, 1) : null} />
+            <Tile label="Contested graduations" value={num(stats.contestedGraduated, 0)} sub="independent buyers competed" />
+          </div>
+        )}
+        <button className="btn ghost spaced" onClick={onReset}>Design a new SOL curve instead</button>
+      </section>
+      <section className="card">
+        <h2>Bonding curve</h2>
+        <p className="caption">Market cap ({quote}) against {quote} raised, from launch to graduation, as deployed on chain.</p>
+        <LineChart
+          series={[{ name: fork.label, color: "var(--s1)", points: info.curve.map((p: any) => ({ x: p.quote, y: p.mcap })) }]}
+          xLabel={`${quote} raised`} xFormat={(v) => compact(v)} yFormat={(v) => compact(v)}
+        />
+      </section>
+      <section className="card">
+        <h2>What this config does</h2>
+        <dl className="kv">
+          <dt>Graduates at</dt><dd><b>{num(info.migrationThreshold, 2)} {quote}</b> raised</dd>
+          <dt>Market cap</dt><dd>{compact(info.initialMcap)} → {compact(info.migrationMcap)} {quote} ({num(info.migrationMcap / info.initialMcap, 1)}x)</dd>
+          <dt>Supply sold on curve</dt><dd>{num(info.supplySplit.curve, 1)}%</dd>
+          <dt>Trading fee</dt><dd>{feeLabel(info.shape)}</dd>
+          <dt>LP after migration</dt><dd>{lpLabel(info.shape)}</dd>
+        </dl>
+      </section>
+      <section className="card">
+        <h2>Outcome priors</h2>
+        <p className="muted">
+          Unavailable for {quote}: Litmus benchmarks SOL and USDC thresholds only, and a {quote} threshold can't be compared with those without a
+          price conversion, which would change what the numbers mean.
+        </p>
+      </section>
+    </div>
   );
 }
 
@@ -288,19 +369,20 @@ function Priors({ threshold, quote }: { threshold: number; quote: string }) {
   const b = poll.data;
   const buckets: Bucket[] = b?.byThreshold ?? [];
   const mine = buckets.findIndex((x) => threshold >= x.min && (x.max == null || threshold < x.max));
+  const near = threshold.toLocaleString("en", { maximumSignificantDigits: 3 });
   return (
     <section className={poll.stale ? "card stale" : "card"}>
       <h2>Outcome priors</h2>
-      <p className="caption">
-        Configs shaped like yours: every {quote}-quoted DBC pool since April 2025 with a migration threshold near {threshold.toLocaleString("en", { maximumSignificantDigits: 3 })} {quote}.
-      </p>
       {b ? (
         <>
-          <div className="tiles inset">
-            <Tile label="Graduation rate, uncontested excluded" value={pct(b.organicGradRate, 1)} sub={`${num(b.organicSample, 0)} pools not judged uncontested`} />
-            <Tile label="Counting uncontested too" value={pct(b.gradRate, 1)} sub={`${num(b.sample, 0)} pools`} />
-            <Tile label="Median time to graduate" value={duration(b.medianSecondsToGraduate)} />
-          </div>
+          <p className="lede">
+            Configs near {near} {quote}: <b>{pct(b.gradRate, 1)}</b> complete their curve, <b>{pct(b.organicGradRate, 1)}</b> excluding uncontested pools.
+          </p>
+          <p className="caption">
+            Every {quote}-quoted DBC pool since April 2025 with a {mine >= 0 ? bucketLabel(buckets[mine]) : near} {quote} threshold: {num(b.sample, 0)} pools,{" "}
+            {num(b.organicSample, 0)} of them not uncontested. The gap is curves that filled without real competition. Median time to graduate,
+            uncontested left out: {duration(b.medianSecondsToGraduate)}.
+          </p>
           <ColumnChart
             series={[{ name: "All pools", color: "var(--muted)" }, { name: "Uncontested excluded", color: "var(--s1)" }]}
             format={(v) => pct(v, 1)}

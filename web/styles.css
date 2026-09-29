@@ -13,10 +13,14 @@
   --s2: #d95926;
   --s3: #199e70;
   --s4: #c98500;
-  --track: #184f95;
   --good: #0ca30c;
   --warning: #fab219;
   --critical: #d03b3b;
+  /* Verdict colors, the same on badges, charts, feed dots and rows. Unverified is deliberately gray (no verdict yet):
+     validated against blue and orange on the dark surface (CVD dE 11.3, normal-vision 16.7, >= 3:1). */
+  --contested: var(--s1);
+  --uncontested: var(--s2);
+  --unverified: var(--muted);
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 14px;
   line-height: 1.45;
@@ -44,6 +48,7 @@ nav.tabs a[aria-current="page"] { background: var(--surface-2); color: var(--tex
 }
 @media (max-width: 560px) {
   .brand small { display: block; margin: 2px 0 0; }
+  nav.tabs { flex-wrap: wrap; }
   nav.tabs a { padding: 6px 10px; }
 }
 
@@ -137,9 +142,10 @@ td.time { width: 7em; }
   background: var(--surface-2); color: var(--text-2); font-size: 11px; cursor: pointer; white-space: nowrap;
 }
 .flag::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
-.flag.contested::before { background: var(--s1); }
-.flag.unverified::before { background: var(--s3); }
-.flag.uncontested::before { background: var(--s2); }
+.flag.contested::before, .dot.contested { background: var(--contested); }
+.flag.unverified::before, .dot.unverified { background: var(--unverified); }
+.flag.uncontested::before, .dot.uncontested { background: var(--uncontested); }
+.dot.ring { background: none; box-shadow: inset 0 0 0 1.5px var(--muted); }
 .flag:hover { color: var(--text); border-color: var(--axis); }
 .evidence {
   width: min(420px, calc(100vw - 32px)); padding: 16px; border: 1px solid var(--border); border-radius: 10px;
@@ -152,9 +158,9 @@ td.time { width: 7em; }
 .evidence-line { white-space: normal; }
 
 .meter { display: flex; align-items: center; gap: 8px; min-width: 110px; }
-.meter .track { flex: 1; height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--track) 45%, transparent); overflow: hidden; }
-.meter .fill { height: 100%; border-radius: 3px; background: var(--s1); }
-.meter .fill.near { background: var(--good); }
+/* Progress is neutral: blue stays reserved for contested in the rows it sits in. */
+.meter .track { flex: 1; height: 6px; border-radius: 3px; background: var(--axis); overflow: hidden; }
+.meter .fill { height: 100%; border-radius: 3px; background: var(--text-2); }
 .meter span { width: 38px; text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); font-size: 12px; }
 
 .feed { list-style: none; margin: 0; padding: 0; height: 560px; overflow-y: auto; }
@@ -229,12 +235,13 @@ td.time { width: 7em; }
 .split-rows .raw, .split-rows .judged { padding: 8px 16px 8px 0; min-width: 0; display: grid; align-content: center; gap: 2px; }
 .split-rows .judged { padding-left: 16px; border-left: 1px solid var(--grid); }
 .split-rows b { font-size: 16px; font-weight: 600; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.split-rows .kind { font-size: 13px; color: var(--text-2); white-space: nowrap; }
+.split-rows .name-row { flex-wrap: nowrap; }
+.split-rows .kind { font-size: 13px; color: var(--text-2); white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .split-rows .sub { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .split-rows .receipts { margin-left: auto; display: flex; gap: 10px; white-space: nowrap; }
 .split-rows .receipts a { color: var(--muted); }
 .split .flag { font-size: 12px; padding: 2px 8px; }
-.split-rows li.contested .judged { background: color-mix(in srgb, var(--s1) 14%, transparent); box-shadow: inset 3px 0 var(--s1); }
+.split-rows li.contested .judged { background: color-mix(in srgb, var(--contested) 14%, transparent); box-shadow: inset 3px 0 var(--contested); }
 .split-rows li.contested .judged .sub { color: var(--text-2); }
 /* A new row grows in, so the rows below slide down instead of jumping. */
 .split-rows li.fresh { overflow: hidden; animation: grow 0.35s ease-out, arrive 1.6s ease-out; }
@@ -254,6 +261,15 @@ td.time { width: 7em; }
 .studio { display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 16px; align-items: start; }
 @media (max-width: 900px) { .studio { grid-template-columns: 1fr; } }
 .studio-out { display: grid; gap: 16px; min-width: 0; }
+.studio-out.span { grid-column: 1 / -1; grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr)); align-items: start; }
+.studio-out .full { grid-column: 1 / -1; }
+.btn.spaced { margin-top: 12px; }
+.note { font-size: 13px; color: var(--text-2); margin: 0 0 12px; padding-left: 10px; border-left: 2px solid var(--axis); }
+.verdict-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; font-size: 12px; color: var(--muted); }
+.verdict-legend > span { display: inline-flex; align-items: center; gap: 6px; }
+.verdict-legend b { font-weight: 550; color: var(--text-2); }
+.filters .verdict-legend { flex-basis: 100%; }
+.split .verdict-legend { margin: -4px 0 12px; }
 fieldset { border: 0; border-top: 1px solid var(--grid); margin: 12px 0 0; padding: 12px 0 0; display: grid; gap: 10px; }
 legend { color: var(--text-2); font-weight: 600; font-size: 13px; padding: 0 0 4px; }
 .field { display: grid; gap: 4px; font-size: 13px; }

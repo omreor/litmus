@@ -34,7 +34,7 @@ const monthDate = (month: string) => new Date(`${month}-01T00:00:00Z`);
 export const monthLabel = (month: string) => `${monthDate(month).toLocaleString("en", { month: "short", timeZone: "UTC" })} '${month.slice(2, 4)}`;
 export const monthName = (month: string) => monthDate(month).toLocaleString("en", { month: "long", year: "numeric", timeZone: "UTC" });
 
-export const launchpadName = (launchpad: { id: string; name: string | null }) => launchpad.name ?? short(launchpad.id);
+export const launchpadName = (launchpad: { id: string; name: string | null }) => launchpad.name ?? `Unlabeled launchpad ${short(launchpad.id)}`;
 
 export type Shape = {
   quoteMint: string;
@@ -69,5 +69,5 @@ export function lpLabel({ lp }: Shape) {
   return parts.join(", ") || "none";
 }
 
-export const presetLabel = (shape: Shape) =>
-  [quoteSymbol(shape.quoteMint), feeLabel(shape), `LP ${lpLabel(shape)}`, shape.tokenType === "token-2022" ? "Token-2022" : "SPL"].join(" · ");
+export const presetLabel = (shape: Shape, symbol?: string | null) =>
+  [quoteSymbol(shape.quoteMint, symbol), feeLabel(shape), `LP ${lpLabel(shape)}`, shape.tokenType === "token-2022" ? "Token-2022" : "SPL"].join(" · ");
