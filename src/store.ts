@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
 import { templateOf, type ConfigFields } from "./dbc";
 
-export const db = new Database(process.env.DB_PATH ?? "curvature.sqlite", { create: true });
-db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+export const db = new Database(process.env.DB_PATH ?? "litmus.sqlite", { create: true });
+db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 30000;");
 db.exec(`
 CREATE TABLE IF NOT EXISTS pools (
   address TEXT PRIMARY KEY,
@@ -91,12 +91,65 @@ addColumns("configs", [
   "collect_fee_mode INTEGER", "migration_option INTEGER", "activation_type INTEGER", "token_decimals INTEGER",
   "token_type INTEGER", "migration_fee_option INTEGER", "creator_fee_pct INTEGER", "template TEXT", "launchpad TEXT", "signer TEXT",
 ]);
-addColumns("pools", ["fees_quote INTEGER"]);
+// verdict: 1 contested, 0 uncontested, NULL unverified; rules: ids of the rules that fired (integrity.ts).
+addColumns("pools", ["fees_quote INTEGER", "verdict INTEGER", "rules TEXT"]);
 addColumns("partners", ["jupiter TEXT"]);
+addColumns("templates", ["rules TEXT"]);
+addColumns("launchpads", ["rules TEXT"]);
 db.exec(`
 CREATE INDEX IF NOT EXISTS configs_template ON configs(template);
 CREATE INDEX IF NOT EXISTS configs_launchpad ON configs(launchpad);
+CREATE INDEX IF NOT EXISTS pools_created_verdict ON pools(created_at, verdict);
+CREATE INDEX IF NOT EXISTS pools_config_created ON pools(config, created_at);
+DROP INDEX IF EXISTS pools_config;
+CREATE INDEX IF NOT EXISTS pools_graduated_verdict ON pools(graduated_at, verdict);
+CREATE INDEX IF NOT EXISTS pools_last_trade ON pools(last_trade_at);
+-- Transaction evidence per pool (evidence.ts). complete = the creation transaction was seen, so the
+-- counts cover the pool's whole life.
+CREATE TABLE IF NOT EXISTS pool_evidence (
+  pool TEXT PRIMARY KEY,
+  complete INTEGER NOT NULL DEFAULT 0,
+  creation_slot INTEGER,
+  creation_sig TEXT,
+  creators TEXT NOT NULL DEFAULT '[]',
+  creator_fill INTEGER NOT NULL DEFAULT 0,
+  creator_fill_sig TEXT,
+  slot_fill INTEGER NOT NULL DEFAULT 0,
+  buy_volume INTEGER NOT NULL DEFAULT 0,
+  sell_volume INTEGER NOT NULL DEFAULT 0,
+  creator_volume INTEGER NOT NULL DEFAULT 0,
+  buyers INTEGER NOT NULL DEFAULT 0,
+  trades INTEGER NOT NULL DEFAULT 0,
+  completion_slot INTEGER,
+  completion_sig TEXT,
+  source TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pool_buyers (pool TEXT NOT NULL, wallet TEXT NOT NULL, PRIMARY KEY (pool, wallet)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS seen_txs (sig TEXT PRIMARY KEY, slot INTEGER NOT NULL) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS seen_txs_slot ON seen_txs(slot);
+-- Post-graduation state of the DAMM v2 pool a graduated DBC pool migrated to (postgrad.ts). day 0 is
+-- the first read after migration, 1 and 7 are snapshots a day and a week after graduation, -1 the latest
+-- read and -2 the one before it (fee counters growing in between = the pool still trades).
+CREATE TABLE IF NOT EXISTS post_graduation (
+  pool TEXT NOT NULL,
+  day INTEGER NOT NULL,
+  at INTEGER NOT NULL,
+  damm TEXT,
+  liquidity REAL,
+  liquidity_usd REAL,
+  fees_usd REAL,
+  volume_usd REAL,
+  lp_pulled INTEGER,
+  PRIMARY KEY (pool, day)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS usage (day TEXT NOT NULL, route TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (day, route)) WITHOUT ROWID;
+-- RPC history replays (replay.ts): one row per pool attempted, so runs resume and report progress.
+CREATE TABLE IF NOT EXISTS replays (pool TEXT PRIMARY KEY, scope TEXT NOT NULL, status TEXT NOT NULL, txs INTEGER NOT NULL, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS studio_txs (signature TEXT PRIMARY KEY, kind TEXT NOT NULL, at INTEGER NOT NULL, account TEXT);
 `);
+addColumns("post_graduation", ["liquidity REAL", "fees_a REAL", "fees_b REAL"]);
+// partial = only the creation slot was replayed: fills are exact, buyer and volume counts are not.
+addColumns("pool_evidence", ["partial INTEGER NOT NULL DEFAULT 0"]);
 
 // A pool can already exist from an earlier swap/graduation row if events arrive out of order.
 const insertPool = db.prepare(`

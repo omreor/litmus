@@ -1,9 +1,11 @@
+import { evidenceOf, type Evidence as PoolEvidence } from "./evidence";
 import { db } from "./store";
 
-// Contested vs uncontested graduations. Template and launchpad verdicts are priors computed from
-// history, each with the evidence values behind it; pool-level evidence overrides them where it
-// exists. Bump RULES_VERSION whenever a rule or threshold changes.
-export const RULES_VERSION = 1;
+// Contested vs uncontested vs unverified. Pool rules judge a pool from its own transactions (and from
+// account state: completion time, threshold); template and launchpad verdicts are priors computed from
+// history, used only for pools without transaction evidence. RULES is the single source of truth for
+// thresholds (served at /api/rules); bump RULES_VERSION whenever a rule or threshold changes.
+export const RULES_VERSION = 2;
 
 const SOL = "So11111111111111111111111111111111111111112";
 const DEFAULT_PUBKEY = "11111111111111111111111111111111";
@@ -55,49 +57,88 @@ export function assignLaunchpads() {
     THEN leftover_receiver ELSE fee_claimer END`).run({ $default: DEFAULT_PUBKEY, $burn: INCINERATOR, $min: PER_TOKEN_CLAIMERS });
 }
 
-// Pool evidence: curve completed within a second of creation. Creation times are exact for these
-// (timestamp activation, or the block time of the activation slot; see backfill.ts).
+// Pool rules. Completion within a second of creation: creation times from account state are exact for
+// these (timestamp activation, or the block time of the activation slot; see backfill.ts).
 export const SAME_SLOT_SECONDS = 1;
-
-// Shared by stats queries: `p` pools, `c` configs, `t` template prior, `l` launchpad prior.
-export const POOL_JOINS = `FROM pools p JOIN configs c ON c.address = p.config
-  LEFT JOIN templates t ON t.template = c.template LEFT JOIN launchpads l ON l.id = c.launchpad`;
-export const SAME_SLOT = `COALESCE(p.graduated_at - p.created_at <= ${SAME_SLOT_SECONDS}, 0)`;
-// Not an organic launch / uncontested graduation: pool evidence, else the template or launchpad prior.
-export const FACTORY = `(${SAME_SLOT} OR COALESCE(t.factory, 0) OR COALESCE(l.factory, 0))`;
+const CREATOR_FILL = 0.5;
+const FEW_BUYERS = 3;
+const NON_CREATOR_VOLUME = 0.5;
+const SUB_THRESHOLD_SOL = 1;
 // Priors. Template graduation rates are bimodal (templates with 20+ pools: 1,046 under 5%, 308 at
 // 95%+, 138 in between), and organic launches graduate at a few percent, so 80%+ over 20+ pools
 // does not happen by chance (binomial, p = 0.1: < 1e-9).
 const MIN_POOLS = 20;
 const AUTO_COMPLETE_RATE = 0.8;
 const SAME_SLOT_SHARE = 0.5;
-const SUB_THRESHOLD_LAMPORTS = 1e9;
 // The 1-bps fee era (until v0.1.7 raised the minimum to 25 bps): big templates that never graduate.
 const VOLUME_FARM = { pools: 200, rate: 0.01, maxFeeBps: 1 };
 
-type Evidence = {
+// Post-graduation: a DAMM v2 pool counts as alive while it holds at least this much liquidity (USD).
+export const ALIVE_LIQUIDITY_USD = 1000;
+
+const pct = (x: number) => (x === 1 ? "100%" : x >= 0.1 ? `${Math.round(x * 100)}%` : `${(x * 100).toFixed(1)}%`);
+const count = (n: number) => n.toLocaleString("en-US");
+
+export const RULES = [
+  { id: "same-slot", name: "Same-slot completion", threshold: "creation slot", description: "The curve completed in the slot it was created in." },
+  {
+    id: "creator-fill", name: "Creator fill", threshold: `>= ${pct(CREATOR_FILL)} of threshold`,
+    description: "The creator or the wallet that signed the creation filled this much of the curve in the creation slot. A small dev first-buy is fine.",
+  },
+  {
+    id: "bundle-fill", name: "Creation-slot fill", threshold: `>= ${pct(CREATOR_FILL)} of threshold`,
+    description: "Buys bundled into the creation slot, by any wallets, left the curve this full.",
+  },
+  { id: "few-buyers", name: "Few buyers", threshold: `<= ${FEW_BUYERS} wallets`, description: "The curve completed with this few distinct buyers." },
+  {
+    id: "creator-volume", name: "Creator volume", threshold: `< ${pct(NON_CREATOR_VOLUME)} from others`,
+    description: "Most trading volume before graduation came from the creator side.",
+  },
+  { id: "sub-1-sol", name: "Sub-1-SOL threshold", threshold: `< ${SUB_THRESHOLD_SOL} SOL`, description: "The curve completes on a trivial buy." },
+  {
+    id: "volume-farm", name: "Volume farm", threshold: `>= ${VOLUME_FARM.pools} pools, < ${pct(VOLUME_FARM.rate)} graduate, <= ${VOLUME_FARM.maxFeeBps} bps fee`,
+    description: "Pools launched in bulk at a near-zero fee to wash volume.",
+  },
+  {
+    id: "template-prior", name: "Template prior", threshold: `>= ${MIN_POOLS} pools, >= ${pct(AUTO_COMPLETE_RATE)} completed`,
+    description: `Only for pools without transaction evidence: the template auto-completes (or >= ${pct(SAME_SLOT_SHARE)} complete at creation).`,
+  },
+  {
+    id: "launchpad-prior", name: "Launchpad prior", threshold: `>= ${MIN_POOLS} pools, >= ${pct(AUTO_COMPLETE_RATE)} completed`,
+    description: "The same prior for the launchpad identity behind the config.",
+  },
+  {
+    id: "contested", name: "Contested", threshold: `> ${FEW_BUYERS} buyers, no rule fired`,
+    description: "Transactions seen from creation, independent buyers, no rule fired. No evidence and no rule: unverified.",
+  },
+  {
+    id: "alive", name: "Alive after graduation", threshold: `>= $${ALIVE_LIQUIDITY_USD.toLocaleString("en-US")} liquidity, trading`,
+    description: "Not a verdict rule: the DAMM v2 pool still holds this much liquidity and earns fees at +1d / +7d.",
+  },
+];
+
+type Stats = {
   pools: number; graduated: number; gradRate: number; sameSlot: number; sameSlotShare: number | null;
   medianSecondsToGraduate: number | null; creators: number; feesQuote: number;
   quoteMint: string; threshold: number; cliffFeeBps: number;
 };
 
-const pct = (x: number) => (x === 1 ? "100%" : `${(x * 100).toFixed(1)}%`);
-
-function priorReasons(e: Evidence, isTemplate: boolean) {
-  const reasons: string[] = [];
-  if (isTemplate && e.quoteMint === SOL && e.threshold < SUB_THRESHOLD_LAMPORTS)
-    reasons.push(`sub-1-SOL threshold: ${e.threshold / 1e9} SOL buys the whole curve`);
+function priorReasons(e: Stats, isTemplate: boolean) {
+  const reasons: [string, string][] = [];
+  const prior = isTemplate ? "template-prior" : "launchpad-prior";
+  if (isTemplate && e.quoteMint === SOL && e.threshold < SUB_THRESHOLD_SOL * 1e9)
+    reasons.push(["sub-1-sol", `sub-1-SOL threshold: ${e.threshold / 1e9} SOL buys the whole curve`]);
   if (e.pools >= MIN_POOLS && e.gradRate >= AUTO_COMPLETE_RATE)
-    reasons.push(`auto-completing: ${pct(e.gradRate)} of ${e.pools.toLocaleString("en-US")} pools graduated`);
+    reasons.push([prior, `auto-completing: ${pct(e.gradRate)} of ${count(e.pools)} pools graduated`]);
   if (e.graduated >= MIN_POOLS && e.sameSlotShare !== null && e.sameSlotShare >= SAME_SLOT_SHARE)
-    reasons.push(`completes at creation: ${pct(e.sameSlotShare)} of graduations within ${SAME_SLOT_SECONDS}s of launch`);
+    reasons.push([prior, `completes at creation: ${pct(e.sameSlotShare)} of graduations within ${SAME_SLOT_SECONDS}s of launch`]);
   if (isTemplate && e.pools >= VOLUME_FARM.pools && e.gradRate < VOLUME_FARM.rate && e.cliffFeeBps <= VOLUME_FARM.maxFeeBps)
-    reasons.push(`volume farm: ${e.cliffFeeBps} bps fee, ${e.graduated} of ${e.pools.toLocaleString("en-US")} pools graduated`);
+    reasons.push(["volume-farm", `volume farm: ${e.cliffFeeBps} bps fee, ${e.graduated} of ${count(e.pools)} pools graduated`]);
   return reasons;
 }
 
 // Median of `value` per key, from rows ordered by key then value.
-function medians(sql: string) {
+export function medians(sql: string) {
   const out = new Map<string, number>();
   let key: string | null = null;
   let values: number[] = [];
@@ -114,14 +155,14 @@ function medians(sql: string) {
   return out;
 }
 
-function evidenceBy(column: "template" | "launchpad") {
+function statsBy(column: "template" | "launchpad") {
   const ttg = medians(`SELECT c.${column} key, p.graduated_at - p.created_at value FROM pools p JOIN configs c ON c.address = p.config
     WHERE p.graduated_at IS NOT NULL ORDER BY key, value`);
   const rows = db.query(`SELECT c.${column} key, COUNT(*) pools, COUNT(p.graduated_at) graduated,
-      SUM(${SAME_SLOT}) same_slot, COUNT(DISTINCT p.creator) creators,
+      SUM(COALESCE(p.graduated_at - p.created_at <= ${SAME_SLOT_SECONDS}, 0)) same_slot, COUNT(DISTINCT p.creator) creators,
       COALESCE(SUM(p.fees_quote), 0) fees_quote, MIN(c.quote_mint) quote_mint, MIN(c.threshold) threshold, MAX(c.cliff_fee_bps) cliff_fee_bps
     FROM pools p JOIN configs c ON c.address = p.config GROUP BY key`).all() as any[];
-  return rows.map((r): [string, Evidence] => [r.key, {
+  return rows.map((r): [string, Stats] => [r.key, {
     pools: r.pools, graduated: r.graduated, gradRate: r.graduated / r.pools, sameSlot: r.same_slot,
     sameSlotShare: r.graduated ? r.same_slot / r.graduated : null, medianSecondsToGraduate: ttg.get(r.key) ?? null,
     creators: r.creators, feesQuote: r.fees_quote, quoteMint: r.quote_mint, threshold: r.threshold, cliffFeeBps: r.cliff_fee_bps,
@@ -135,21 +176,177 @@ export function classify() {
   const viaLeftover = new Set(
     db.query("SELECT DISTINCT launchpad FROM configs WHERE launchpad = leftover_receiver AND fee_claimer != leftover_receiver").values().flat(),
   );
-  const templates = evidenceBy("template");
-  const launchpads = evidenceBy("launchpad").filter(([id, e]) => e.pools >= MIN_POOLS || viaLeftover.has(id));
-  const saveTemplate = db.prepare("INSERT INTO templates (template, factory, reasons, evidence) VALUES (?, ?, ?, ?)");
-  const saveLaunchpad = db.prepare("INSERT INTO launchpads (id, via, factory, reasons, evidence) VALUES (?, ?, ?, ?, ?)");
+  const templates = statsBy("template");
+  const launchpads = statsBy("launchpad").filter(([id, e]) => e.pools >= MIN_POOLS || viaLeftover.has(id));
+  const saveTemplate = db.prepare("INSERT INTO templates (template, factory, reasons, rules, evidence) VALUES (?, ?, ?, ?, ?)");
+  const saveLaunchpad = db.prepare("INSERT INTO launchpads (id, via, factory, reasons, rules, evidence) VALUES (?, ?, ?, ?, ?, ?)");
+  const columns = (reasons: [string, string][]) => [reasons.length ? 1 : 0, JSON.stringify(reasons.map((r) => r[1])), JSON.stringify(reasons.map((r) => r[0]))] as const;
   db.transaction(() => {
     db.exec("DELETE FROM templates; DELETE FROM launchpads");
-    for (const [id, e] of templates) {
-      const reasons = priorReasons(e, true);
-      saveTemplate.run(id, reasons.length ? 1 : 0, JSON.stringify(reasons), JSON.stringify(e));
-    }
-    for (const [id, e] of launchpads) {
-      const reasons = priorReasons(e, false);
-      const via = viaLeftover.has(id) ? "leftover_receiver" : "fee_claimer";
-      saveLaunchpad.run(id, via, reasons.length ? 1 : 0, JSON.stringify(reasons), JSON.stringify(e));
-    }
-  })();
-  return { templates: templates.length, launchpads: launchpads.length };
+    for (const [id, e] of templates) saveTemplate.run(id, ...columns(priorReasons(e, true)), JSON.stringify(e));
+    for (const [id, e] of launchpads) saveLaunchpad.run(id, viaLeftover.has(id) ? "leftover_receiver" : "fee_claimer", ...columns(priorReasons(e, false)), JSON.stringify(e));
+  }).immediate();
+  return { templates: templates.length, launchpads: launchpads.length, ...judgeAll() };
 }
+
+export type Prior = { rules: string[]; reasons: string[] };
+export type PoolFacts = {
+  createdAt: number | null; graduatedAt: number | null; quoteMint: string; threshold: number; decimals: number;
+  template: Prior | null; launchpad: Prior | null;
+};
+export type Signals = {
+  creatorFillPct: number | null; creationSlotFillPct: number | null; distinctBuyers: number | null;
+  nonCreatorVolumePct: number | null; sameSlotCompletion: boolean | null; thresholdQuote: number;
+};
+export type Judgement = {
+  verdict: "contested" | "uncontested" | "unverified"; rules: string[]; reasons: string[];
+  evidence: Record<string, string>; signals: Signals; receipts: string[];
+};
+
+// One pool's verdict. Pool rules fire from transaction evidence (only counted when it covers the pool
+// from creation) and account state; priors apply only when there is no transaction evidence.
+export function judge(f: PoolFacts, ev: PoolEvidence | null): Judgement {
+  // creation: the creation slot was seen (fills exact); complete: the whole life was seen (counts exact too).
+  const creation = ev?.complete ? ev : null;
+  const complete = creation && !creation.partial ? creation : null;
+  const graduated = f.graduatedAt !== null;
+  const volume = complete ? complete.buy_volume + complete.sell_volume : 0;
+  const signals: Signals = {
+    // Net fills can pass 100% when others sold in the same slot; a curve can't be more than full.
+    creatorFillPct: creation && f.threshold ? Math.min(Math.max(creation.creator_fill, 0) / f.threshold, 1) : null,
+    creationSlotFillPct: creation && f.threshold ? Math.min(creation.slot_fill / f.threshold, 1) : null,
+    distinctBuyers: complete ? complete.buyers : null,
+    nonCreatorVolumePct: complete && volume ? 1 - complete.creator_volume / volume : null,
+    sameSlotCompletion: !graduated ? (complete ? false : null)
+      : creation?.completion_slot != null ? creation.completion_slot === creation.creation_slot
+      : f.createdAt !== null ? f.graduatedAt! - f.createdAt <= SAME_SLOT_SECONDS : null,
+    thresholdQuote: f.threshold / 10 ** f.decimals,
+  };
+  const rules: string[] = [];
+  const reasons: string[] = [];
+  const evidence: Record<string, string> = {};
+  const firedKeys = new Set<string>();
+  const fire = (rule: string, reason: string, key: string) => (rules.push(rule), reasons.push(reason), firedKeys.add(key));
+  // Evidence behind a verdict first, the rest after it.
+  const result = (verdict: Judgement["verdict"]): Judgement => ({
+    verdict, rules: [...new Set(rules)], reasons, signals, receipts,
+    evidence: Object.fromEntries(Object.entries(evidence).sort(([a], [b]) => Number(firedKeys.has(b)) - Number(firedKeys.has(a)))),
+  });
+
+  if (signals.sameSlotCompletion) {
+    evidence["same-slot completion"] = creation?.completion_slot != null ? `slot ${count(creation.completion_slot)}` : `completed within ${SAME_SLOT_SECONDS}s of launch`;
+    fire("same-slot", `same-slot completion (${evidence["same-slot completion"]})`, "same-slot completion");
+  }
+  if (signals.creatorFillPct !== null) {
+    evidence["creator fill"] = `${pct(signals.creatorFillPct)} of the threshold in the creation slot`;
+    if (signals.creatorFillPct >= CREATOR_FILL) fire("creator-fill", `creator fill ${evidence["creator fill"]}`, "creator fill");
+  }
+  if (signals.creationSlotFillPct !== null && signals.creationSlotFillPct >= CREATOR_FILL && !rules.includes("creator-fill")) {
+    evidence["creation-slot fill"] = `${pct(signals.creationSlotFillPct)} of the threshold, bundled with the launch`;
+    fire("bundle-fill", `creation-slot fill ${evidence["creation-slot fill"]}`, "creation-slot fill");
+  }
+  if (signals.distinctBuyers !== null) {
+    evidence["distinct buyers"] = `${count(signals.distinctBuyers)}${graduated ? " before graduation" : " so far"}`;
+    if (graduated && signals.distinctBuyers <= FEW_BUYERS) fire("few-buyers", `${signals.distinctBuyers} distinct buyers`, "distinct buyers");
+  }
+  if (signals.nonCreatorVolumePct !== null) {
+    evidence["volume from non-creators"] = pct(signals.nonCreatorVolumePct);
+    if (graduated && signals.nonCreatorVolumePct < NON_CREATOR_VOLUME) fire("creator-volume", `only ${pct(signals.nonCreatorVolumePct)} of volume from non-creators`, "volume from non-creators");
+  }
+  if (f.quoteMint === SOL && f.threshold < SUB_THRESHOLD_SOL * 1e9) {
+    evidence.threshold = `${signals.thresholdQuote} SOL`;
+    fire("sub-1-sol", `threshold ${evidence.threshold}`, "threshold");
+  }
+  const farm = f.template?.rules.indexOf("volume-farm") ?? -1;
+  if (farm >= 0) {
+    evidence["volume farm"] = f.template!.reasons[farm].replace("volume farm: ", "");
+    fire("volume-farm", f.template!.reasons[farm], "volume farm");
+  }
+  const receipts = creation ? [...new Set([creation.creation_sig, creation.creator_fill_sig, creation.completion_sig].filter((s) => s !== null))] : [];
+  if (rules.length) return result("uncontested");
+  // Priors don't decide against transaction evidence, but stay visible next to it.
+  const priorNotes = () =>
+    ([[f.template, "template"], [f.launchpad, "launchpad"]] as const).forEach(([prior, name]) =>
+      prior?.rules.forEach((rule, i) => rule === `${name}-prior` && (evidence[name] ??= prior.reasons[i])),
+    );
+  if (complete && complete.buyers > FEW_BUYERS) {
+    priorNotes();
+    return result("contested");
+  }
+
+  for (const [prior, name] of [[f.template, "template"], [f.launchpad, "launchpad"]] as const) {
+    prior?.rules.forEach((rule, i) => {
+      if (rule !== `${name}-prior`) return;
+      evidence[name] = prior.reasons[i];
+      fire(rule, `${name} ${prior.reasons[i]}`, name);
+    });
+  }
+  if (rules.length) return result("uncontested");
+  evidence.transactions = complete ? `${complete.buyers} buyer${complete.buyers === 1 ? "" : "s"} so far`
+    : creation ? "creation slot replayed; later trades not replayed" : "not replayed yet";
+  return result("unverified");
+}
+
+const VERDICT_CODE = { contested: 1, uncontested: 0, unverified: null } as const;
+
+// API fields for a judgement: `contested` is null when unverified; organic/reasons are the v2 aliases.
+export const verdictFields = (j: Judgement) => ({
+  verdict: j.verdict, contested: VERDICT_CODE[j.verdict] === null ? null : j.verdict === "contested", organic: j.verdict !== "uncontested",
+  evidence: j.evidence, signals: j.signals, receipts: j.receipts, reasons: j.reasons,
+});
+
+const priorOf = (row: { rules: string | null; reasons: string } | null): Prior | null =>
+  row?.rules ? { rules: JSON.parse(row.rules), reasons: JSON.parse(row.reasons) } : null;
+const templatePrior = db.prepare("SELECT rules, reasons FROM templates WHERE template = ?");
+const launchpadPrior = db.prepare("SELECT rules, reasons FROM launchpads WHERE id = ?");
+const poolFactsRow = db.prepare(`SELECT p.created_at, p.graduated_at, c.quote_mint, c.threshold, c.template, c.launchpad, COALESCE(m.decimals, 9) decimals
+  FROM pools p LEFT JOIN configs c ON c.address = p.config LEFT JOIN mints m ON m.mint = c.quote_mint WHERE p.address = ?`);
+const saveVerdict = db.prepare("UPDATE pools SET verdict = ?, rules = ? WHERE address = ?");
+
+export function judgementOf(pool: string) {
+  const r = poolFactsRow.get(pool) as any;
+  if (!r) return null;
+  return judge({
+    createdAt: r.created_at, graduatedAt: r.graduated_at, quoteMint: r.quote_mint ?? SOL, threshold: r.threshold ?? 0, decimals: r.decimals,
+    template: r.template ? priorOf(templatePrior.get(r.template) as any) : null, launchpad: r.launchpad ? priorOf(launchpadPrior.get(r.launchpad) as any) : null,
+  }, evidenceOf(pool));
+}
+
+// Judges one pool and stores the verdict for the aggregates.
+export function judgePool(pool: string) {
+  const j = judgementOf(pool);
+  if (j) saveVerdict.run(VERDICT_CODE[j.verdict], j.rules.join(",") || null, pool);
+  return j;
+}
+
+// Re-judges every pool (after classify, a replay, or a rules change), in rowid chunks so the scan never
+// holds the write lock for long.
+export function judgeAll(chunk = 50_000) {
+  const load = (sql: string) => new Map((db.query(sql).all() as any[]).map((r) => [r.id, priorOf(r)]));
+  const templates = load("SELECT template id, rules, reasons FROM templates");
+  const launchpads = load("SELECT id, rules, reasons FROM launchpads");
+  const maxRowid = (db.query("SELECT MAX(rowid) n FROM pools").get() as { n: number }).n ?? 0;
+  const rows = db.prepare(`SELECT p.address, p.created_at, p.graduated_at, p.verdict, p.rules, c.quote_mint, c.threshold, c.template, c.launchpad,
+      e.pool e_pool, e.*
+    FROM pools p LEFT JOIN configs c ON c.address = p.config LEFT JOIN pool_evidence e ON e.pool = p.address
+    WHERE p.rowid > ? AND p.rowid <= ?`);
+  const counts = { contested: 0, uncontested: 0, unverified: 0, changed: 0 };
+  for (let from = 0; from < maxRowid; from += chunk) {
+    const updates: [number | null, string | null, string][] = [];
+    for (const r of rows.all(from, from + chunk) as any[]) {
+      const j = judge({
+        createdAt: r.created_at, graduatedAt: r.graduated_at, quoteMint: r.quote_mint ?? SOL, threshold: r.threshold ?? 0, decimals: 9,
+        template: templates.get(r.template) ?? null, launchpad: launchpads.get(r.launchpad) ?? null,
+      }, r.e_pool ? r : null);
+      counts[j.verdict]++;
+      const [verdict, rules] = [VERDICT_CODE[j.verdict], j.rules.join(",") || null];
+      if (verdict !== r.verdict || rules !== r.rules) updates.push([verdict, rules, r.address]);
+    }
+    db.transaction(() => updates.forEach((u) => saveVerdict.run(...u))).immediate();
+    counts.changed += updates.length;
+  }
+  db.query("INSERT INTO sync (kind, slot) VALUES ('rules', ?) ON CONFLICT(kind) DO UPDATE SET slot = excluded.slot").run(RULES_VERSION);
+  return counts;
+}
+
+export const rulesStale = () => (db.query("SELECT slot FROM sync WHERE kind = 'rules'").get() as { slot: number } | null)?.slot !== RULES_VERSION;

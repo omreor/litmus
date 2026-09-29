@@ -1,5 +1,5 @@
 import { Connection, PublicKey } from "@solana/web3.js";
-import { CONFIG_SLICE, describeConfig, readConfigSlice } from "./dbc";
+import { CONFIG_SLICE, DBC_PROGRAM_ID, describeConfig, readConfigSlice } from "./dbc";
 import { db, saveConfig } from "./store";
 
 const { RPC_URL, SOLAMI_API_KEY } = process.env;
@@ -31,20 +31,36 @@ export function queueConfig(address: string) {
 
 export async function flushConfigs() {
   const batch = [...pending].slice(0, 100); // getMultipleAccounts limit
-  if (!batch.length) return;
   batch.forEach((a) => pending.delete(a));
-  const infos = await connection.getMultipleAccountsInfo(batch.map((a) => new PublicKey(a)));
+  await describeConfigs(batch);
+}
+
+// Fetches, decodes and stores configs (fingerprint columns, template, full description).
+async function describeConfigs(addresses: string[]) {
+  if (!addresses.length) return;
+  const infos = await connection.getMultipleAccountsInfo(addresses.map((a) => new PublicKey(a)));
   for (const [i, info] of infos.entries()) {
-    if (!info) continue;
+    if (!info || info.owner.toBase58() !== DBC_PROGRAM_ID) continue;
     const fields = readConfigSlice(info.data.subarray(CONFIG_SLICE.offset, CONFIG_SLICE.offset + CONFIG_SLICE.length));
     try {
-      saveConfig(batch[i], fields);
+      saveConfig(addresses[i], fields);
       const { curve, ...d } = describeConfig(info.data, await mintDecimals(fields.quoteMint));
-      describe.run(d.family, JSON.stringify({ ...d, curve }), info.data, batch[i]);
+      describe.run(d.family, JSON.stringify({ ...d, curve }), info.data, addresses[i]);
     } catch (e) {
-      console.error("config decode failed", batch[i], e);
+      console.error("config decode failed", addresses[i], e);
     }
   }
+}
+
+// For API requests about a config we haven't decoded; false when it isn't a DBC config.
+export async function describeNow(address: string) {
+  try {
+    new PublicKey(address);
+  } catch {
+    return false;
+  }
+  await describeConfigs([address]);
+  return !!isKnown.get(address);
 }
 
 // Bump when describeConfig's output changes; stored raw account data lets us recompute in place.

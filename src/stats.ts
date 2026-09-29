@@ -1,151 +1,126 @@
+import { quote } from "./aggregates";
+import { describeNow } from "./enrich";
+import { evidenceOf } from "./evidence";
+import { graduationItem, launchpadOf } from "./indexer";
+import { judgementOf, verdictFields } from "./integrity";
+import { postGraduationOf } from "./postgrad";
 import { db } from "./store";
 
-const PROGRESS_STEPS = [0.1, 0.25, 0.5, 0.75, 0.9];
-// A pool with no trades for this long is treated as settled (dead or graduated) for odds.
-const SETTLE_SECONDS = 6 * 3600;
+// Cheap, index-backed reads served straight from the database; the full-history aggregates live in
+// aggregates.ts. `organic` = not judged uncontested (contested or unverified).
 
 const now = () => Math.floor(Date.now() / 1000);
-const median = (xs: number[]) => {
-  if (!xs.length) return null;
-  const s = xs.toSorted((a, b) => a - b);
-  return s[Math.floor(s.length / 2)];
-};
 
 export function overview(since: number) {
-  const pools = db
-    .query(`SELECT
-      COUNT(*) FILTER (WHERE created_at >= $since) launches,
-      COUNT(*) FILTER (WHERE graduated_at >= $since) graduations,
-      COUNT(*) FILTER (WHERE last_trade_at >= $since) active
-    FROM pools`)
-    .get({ $since: since });
-  const volume = db
-    .query(`SELECT c.quote_mint mint, m.symbol, m.decimals, SUM(h.volume) volume, SUM(h.trades) trades
-      FROM config_hourly h JOIN configs c ON c.address = h.config LEFT JOIN mints m ON m.mint = c.quote_mint
-      WHERE h.hour >= $hour GROUP BY c.quote_mint ORDER BY volume DESC`)
-    .all({ $hour: Math.floor(since / 3600) });
-  return { ...(pools as object), volume };
+  const launches = db.query(`SELECT COUNT(*) launches, COALESCE(SUM(verdict IS NOT 0), 0) organic, COALESCE(SUM(verdict = 1), 0) contested
+    FROM pools WHERE created_at >= ?`).get(since) as any;
+  const graduations = db.query(`SELECT COUNT(*) graduations, COALESCE(SUM(verdict IS NOT 0), 0) organic, COALESCE(SUM(verdict = 1), 0) contested
+    FROM pools WHERE graduated_at >= ?`).get(since) as any;
+  const { active } = db.query("SELECT COUNT(*) active FROM pools WHERE last_trade_at >= ?").get(since) as any;
+  // Live volume per quote token, and how much of it traded on volume-farm templates (1 bps, never graduate).
+  const volume = db.query(`SELECT c.quote_mint mint, m.symbol, COALESCE(m.decimals, 9) decimals, SUM(h.volume) volume, SUM(h.trades) trades,
+      COALESCE(SUM(h.volume) FILTER (WHERE t.rules LIKE '%volume-farm%'), 0) farmVolume
+    FROM config_hourly h JOIN configs c ON c.address = h.config LEFT JOIN mints m ON m.mint = c.quote_mint LEFT JOIN templates t ON t.template = c.template
+    WHERE h.hour >= ? GROUP BY c.quote_mint ORDER BY volume DESC`).all(Math.floor(since / 3600)) as any[];
+  const sol = volume.find((v) => v.mint === "So11111111111111111111111111111111111111112");
+  return {
+    launches: launches.launches, graduations: graduations.graduations, active,
+    organic: { launches: launches.organic, graduations: graduations.organic },
+    contested: { launches: launches.contested, graduations: graduations.contested },
+    volume: volume.map(({ farmVolume, ...v }) => ({ ...v, symbol: quote(v.mint).symbol })),
+    volumeFarm: { solVolume: sol?.farmVolume ?? 0, solShare: sol?.volume ? sol.farmVolume / sol.volume : null },
+  };
 }
 
-export function families(since: number, limit = 50) {
-  const rows = db
-    .query(`SELECT c.family, MIN(c.info) sample,
-      COUNT(DISTINCT c.address) configs,
-      COUNT(DISTINCT c.fee_claimer) claimers,
-      COUNT(p.address) FILTER (WHERE p.created_at >= $since) launches,
-      COUNT(p.address) FILTER (WHERE p.created_at >= $since AND p.graduated_at IS NOT NULL) launched_graduated,
-      COUNT(p.address) FILTER (WHERE p.graduated_at >= $since) graduations
-    FROM configs c LEFT JOIN pools p ON p.config = c.address
-    WHERE c.family IS NOT NULL -- backfilled configs are only described once seen live
-    GROUP BY c.family HAVING launches + graduations > 0
-    ORDER BY launches DESC LIMIT $limit`)
-    .all({ $since: since, $limit: limit }) as any[];
-  const volume = db.prepare(`SELECT SUM(h.volume) volume, SUM(h.trades) trades FROM config_hourly h
-    JOIN configs c ON c.address = h.config WHERE c.family = ? AND h.hour >= ?`);
-  const gradTimes = db.prepare(`SELECT p.graduated_at - p.created_at secs FROM pools p JOIN configs c ON c.address = p.config
-    WHERE c.family = ? AND p.created_at >= ? AND p.graduated_at IS NOT NULL`);
-  return rows.map(({ sample, ...r }) => {
-    const { curve, ...info } = JSON.parse(sample);
-    return {
-      ...r,
-      ...(volume.get(r.family, Math.floor(since / 3600)) as object),
-      gradRate: r.launches ? r.launched_graduated / r.launches : null,
-      medianSecondsToGraduate: median((gradTimes.all(r.family, since) as any[]).map((x) => x.secs)),
-      shape: info.shape,
-    };
-  });
+// Empirical odds for a live pool: graduation rate of its template's settled pools that reached the
+// highest progress step this pool has reached. Null until there's a meaningful sample.
+const MIN_ODDS_SAMPLE = 5;
+type Step = { step: number; reached: number; graduated: number };
+function oddsFor(steps: Step[] | undefined, progress: number) {
+  const step = steps?.findLast((s) => progress >= s.step);
+  return step && step.reached >= MIN_ODDS_SAMPLE ? { rate: step.graduated / step.reached, sample: step.reached, step: step.step } : null;
 }
 
-// P(graduate | pool reached X% of its migration threshold), from settled pools we saw launch.
-export function graduationOdds(family: string) {
-  const pools = db
-    .query(`SELECT CAST(p.max_reserve AS REAL) / p.migration_threshold progress, p.graduated_at IS NOT NULL graduated
-      FROM pools p JOIN configs c ON c.address = p.config
-      WHERE c.family = $family AND p.created_at IS NOT NULL AND p.migration_threshold > 0
-        AND (p.graduated_at IS NOT NULL OR p.last_trade_at < $settled)`)
-    .all({ $family: family, $settled: now() - SETTLE_SECONDS }) as { progress: number; graduated: number }[];
-  return PROGRESS_STEPS.map((step) => {
-    const reached = pools.filter((p) => p.graduated || p.progress >= step);
-    return { step, reached: reached.length, graduated: reached.filter((p) => p.graduated).length };
-  });
-}
+const judged = (pool: string) => {
+  const j = judgementOf(pool);
+  return j ? verdictFields(j) : null;
+};
 
-const MIN_SAMPLE = 5;
-let oddsCache = { at: 0, byFamily: new Map<string, ReturnType<typeof graduationOdds>>() };
-function familyOdds(family: string) {
-  if (Date.now() - oddsCache.at > 60_000) oddsCache = { at: Date.now(), byFamily: new Map() };
-  if (!oddsCache.byFamily.has(family)) oddsCache.byFamily.set(family, graduationOdds(family));
-  return oddsCache.byFamily.get(family)!;
-}
-
-// Empirical odds for a live pool: graduation rate of its family's pools that reached the highest
-// progress step this pool has reached. Null until there's a meaningful sample.
-function oddsFor(family: string | null, progress: number) {
-  if (!family) return null;
-  const step = familyOdds(family).findLast((s) => progress >= s.step);
-  return step && step.reached >= MIN_SAMPLE ? { rate: step.graduated / step.reached, sample: step.reached, step: step.step } : null;
-}
-
-export function hotPools(limit = 30) {
-  const rows = db
-    .query(`SELECT p.address, p.config, p.base_mint, p.name, p.symbol, c.family, p.created_at, p.last_trade_at, p.trades,
+export function hotPools(oddsByTemplate: Record<string, Step[]>, limit = 30) {
+  const rows = db.query(`SELECT p.address, p.config, p.base_mint, p.name, p.symbol, c.template family, p.created_at, p.last_trade_at, p.trades,
         p.buys, p.volume_quote, c.quote_mint, CAST(p.quote_reserve AS REAL) / p.migration_threshold progress,
-        p.quote_reserve, p.migration_threshold, m.symbol quote_symbol, m.decimals quote_decimals
-      FROM pools p LEFT JOIN configs c ON c.address = p.config LEFT JOIN mints m ON m.mint = c.quote_mint
-      WHERE p.graduated_at IS NULL AND p.last_trade_at >= $since AND p.migration_threshold > 0
-      ORDER BY progress DESC LIMIT $limit`)
-    .all({ $since: now() - 600, $limit: limit }) as any[];
-  return rows.map((r) => ({ ...r, odds: oddsFor(r.family, r.progress) }));
-}
-
-export function config(address: string) {
-  const row = db.query("SELECT address, fee_claimer, quote_mint, family, info FROM configs WHERE address = ?").get(address) as any;
-  if (!row) return null;
-  const pools = db
-    .query(`SELECT address, base_mint, created_at, graduated_at, trades, volume_quote,
-        CAST(quote_reserve AS REAL) / NULLIF(migration_threshold, 0) progress
-      FROM pools WHERE config = ? ORDER BY COALESCE(last_trade_at, created_at) DESC LIMIT 100`)
-    .all(address);
-  return { ...row, info: JSON.parse(row.info), pools };
-}
-
-export function family(id: string) {
-  const configs = (
-    db
-      .query(`SELECT c.address, c.fee_claimer, c.info, COUNT(p.address) pools, COUNT(p.graduated_at) graduated
-        FROM configs c LEFT JOIN pools p ON p.config = c.address
-        WHERE c.family = ? GROUP BY c.address ORDER BY pools DESC LIMIT 12`)
-      .all(id) as any[]
-  ).map(({ info, ...c }) => ({ ...c, info: JSON.parse(info) }));
-  if (!configs.length) return null;
-  const recent = db
-    .query(`SELECT p.address, p.config, p.name, p.symbol, p.base_mint, p.created_at, p.graduated_at, p.trades,
-        p.volume_quote, CAST(p.max_reserve AS REAL) / NULLIF(p.migration_threshold, 0) peak
-      FROM pools p JOIN configs c ON c.address = p.config
-      WHERE c.family = ? AND p.created_at IS NOT NULL ORDER BY p.created_at DESC LIMIT 25`)
-    .all(id);
-  return { family: id, configs, odds: graduationOdds(id), recent };
-}
-
-const SOL = "So11111111111111111111111111111111111111112";
-const THRESHOLD_BUCKETS = [0, 5, 15, 40, 80, 150, Infinity];
-
-// Graduation outcomes of SOL-quoted launches we saw, bucketed by the config's migration threshold.
-export function thresholdBenchmarks(since: number) {
-  const rows = db
-    .query(`SELECT c.threshold / 1e9 threshold, p.graduated_at - p.created_at secs
-      FROM pools p JOIN configs c ON c.address = p.config
-      WHERE p.created_at >= $since AND c.quote_mint = $sol`)
-    .all({ $since: since, $sol: SOL }) as { threshold: number; secs: number | null }[];
-  return THRESHOLD_BUCKETS.slice(0, -1).map((min, i) => {
-    const max = THRESHOLD_BUCKETS[i + 1];
-    const inBucket = rows.filter((r) => r.threshold >= min && r.threshold < max);
-    const graduated = inBucket.filter((r) => r.secs !== null);
+        p.quote_reserve, p.migration_threshold
+      FROM pools p INDEXED BY pools_last_trade LEFT JOIN configs c ON c.address = p.config
+      WHERE p.last_trade_at >= ? AND p.graduated_at IS NULL AND p.migration_threshold > 0
+      ORDER BY progress DESC LIMIT ?`).all(now() - 600, limit) as any[];
+  return rows.map((r) => {
+    const q = quote(r.quote_mint);
     return {
-      min, max: Number.isFinite(max) ? max : null,
-      launches: inBucket.length,
-      graduated: graduated.length,
-      medianSecondsToGraduate: median(graduated.map((r) => r.secs!)),
+      ...r, quote_symbol: q.symbol, quote_decimals: q.decimals, odds: oddsFor(oddsByTemplate[r.family], r.progress),
+      launchpad: launchpadOf(r.config), ...judged(r.address),
     };
   });
+}
+
+const poolRow = db.prepare(`SELECT p.address, p.config, p.creator, p.base_mint, p.name, p.symbol, p.uri, p.created_at, p.graduated_at, p.last_trade_at,
+    p.quote_reserve, p.trades, p.volume_quote, c.template, c.quote_mint, c.threshold
+  FROM pools p LEFT JOIN configs c ON c.address = p.config WHERE p.address = ?`);
+
+export function poolDetail(address: string) {
+  const p = poolRow.get(address) as any;
+  if (!p) return null;
+  const q = quote(p.quote_mint);
+  const ev = evidenceOf(address);
+  return {
+    ...p, quote: q, progress: p.graduated_at ? 1 : p.threshold ? Math.min(p.quote_reserve / p.threshold, 1) : null,
+    launchpad: launchpadOf(p.config), ...judged(address), postGraduation: p.graduated_at ? postGraduationOf(address) : null,
+    transactions: ev && { source: ev.source, fromCreation: !!ev.complete, creationSlotOnly: !!ev.partial, trades: ev.trades },
+  };
+}
+
+// Latest graduations as stream items. Only graduations whose completing transaction is known (seen live,
+// archived or replayed) qualify, so every item links its transaction.
+const recentGraduations = db.prepare(`SELECT p.address, p.config, p.graduated_at, p.quote_reserve, e.completion_sig
+  FROM pools p JOIN pool_evidence e ON e.pool = p.address
+  WHERE p.graduated_at IS NOT NULL AND e.completion_sig IS NOT NULL ORDER BY p.graduated_at DESC LIMIT ?`);
+export function graduationsRecent(limit: number) {
+  return (recentGraduations.all(Math.min(limit, 200)) as any[])
+    .map((r) => graduationItem(r.address, r.config, r.graduated_at, r.completion_sig, String(r.quote_reserve)))
+    .filter(Boolean);
+}
+
+const configRow = db.prepare("SELECT address, fee_claimer, quote_mint, template, launchpad, info FROM configs WHERE address = ?");
+const configStats = db.prepare(`SELECT COUNT(*) pools, COUNT(graduated_at) graduated, COALESCE(SUM(graduated_at IS NOT NULL AND verdict = 1), 0) contestedGraduated,
+    COALESCE(SUM(graduated_at IS NOT NULL AND verdict IS NOT 0), 0) organicGraduated
+  FROM pools WHERE config = ?`);
+const configPools = db.prepare(`SELECT address, name, symbol, base_mint, created_at, graduated_at, trades, volume_quote, verdict,
+    CAST(quote_reserve AS REAL) / NULLIF(migration_threshold, 0) progress
+  FROM pools WHERE config = ? ORDER BY created_at DESC LIMIT 100`);
+
+// Any config: decoded from chain on first request (so the Studio can fork configs we never saw).
+export async function configDetail(address: string) {
+  let row = configRow.get(address) as any;
+  if (!row?.info) {
+    await describeNow(address);
+    row = configRow.get(address);
+  }
+  if (!row?.info) return null;
+  return {
+    address, info: JSON.parse(row.info), template: row.template, launchpad: row.launchpad ? launchpadOf(address) : null,
+    stats: configStats.get(address), pools: configPools.all(address),
+  };
+}
+
+const usageRows = db.prepare("SELECT day, route, count FROM usage WHERE day >= ? ORDER BY day DESC, count DESC");
+const studioRows = db.prepare("SELECT signature, kind, at, account FROM studio_txs ORDER BY at DESC LIMIT 50");
+const studioCounts = db.prepare("SELECT kind, COUNT(*) n FROM studio_txs GROUP BY kind");
+export function usage(stream: { current: number; peak: number }) {
+  const days: Record<string, Record<string, number>> = {};
+  const peaks: Record<string, number> = {};
+  for (const r of usageRows.all(new Date(Date.now() - 14 * 86400_000).toISOString().slice(0, 10)) as any[]) {
+    if (r.route === "ws:peak") peaks[r.day] = r.count;
+    else (days[r.day] ??= {})[r.route] = r.count;
+  }
+  const counts = Object.fromEntries((studioCounts.all() as { kind: string; n: number }[]).map((r) => [r.kind, r.n]));
+  return { requests: days, stream: { ...stream, peakByDay: peaks }, studio: { deploys: counts.deploy ?? 0, launches: counts.launch ?? 0, recent: studioRows.all() } };
 }

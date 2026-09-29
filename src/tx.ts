@@ -1,5 +1,6 @@
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
-import { Keypair, PublicKey, type Transaction } from "@solana/web3.js";
+import { Keypair, PublicKey, VersionedTransaction, type Transaction } from "@solana/web3.js";
+import { DBC_PROGRAM_ID, dbcIxName } from "./dbc";
 import { connection } from "./enrich";
 import { db } from "./store";
 import { buildConfigParameters, QUOTES, type StudioInput } from "./studio";
@@ -37,7 +38,7 @@ export async function createPoolTx(p: { config: string; wallet: string; name: st
   const mint = Keypair.generate();
   const address = mint.publicKey.toBase58();
   // Metaplex-style off-chain metadata, served by this app at a short URI (on-chain uri max 200 chars).
-  saveMeta.run(address, JSON.stringify({ name: p.name, symbol: p.symbol, image: p.image || undefined, description: `Launched with Curvature on config ${p.config}` }));
+  saveMeta.run(address, JSON.stringify({ name: p.name, symbol: p.symbol, image: p.image || undefined, description: `Launched with Litmus on config ${p.config}` }));
   const tx = await client.creator.createPool({
     name: p.name.slice(0, 32), symbol: p.symbol.slice(0, 10), uri: `${PUBLIC_URL}/api/meta/${address}`,
     payer: creator, poolCreator: creator, config: new PublicKey(p.config), baseMint: mint.publicKey,
@@ -50,4 +51,17 @@ export async function sendSigned(base64: string) {
   const { value } = await connection.confirmTransaction(signature, "confirmed");
   if (value.err) throw new Error(`transaction failed: ${JSON.stringify(value.err)}`);
   return signature;
+}
+
+// What a Studio transaction did, for usage metrics: a config deploy or a token launch (with its mint).
+export function studioAction(base64: string) {
+  const { message } = VersionedTransaction.deserialize(Buffer.from(base64, "base64"));
+  const keys = message.staticAccountKeys.map((k) => k.toBase58());
+  for (const ix of message.compiledInstructions) {
+    if (keys[ix.programIdIndex] !== DBC_PROGRAM_ID) continue;
+    const name = dbcIxName(ix.data);
+    if (name?.startsWith("create_config")) return { kind: "deploy", account: keys[ix.accountKeyIndexes[0]] };
+    if (name?.startsWith("initialize_virtual_pool")) return { kind: "launch", account: keys[ix.accountKeyIndexes[3]] };
+  }
+  return null;
 }

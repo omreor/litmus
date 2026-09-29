@@ -1,7 +1,7 @@
 import { utils } from "@coral-xyz/anchor";
 import { PublicKey, type VersionedTransactionResponse } from "@solana/web3.js";
 import Client, { CommitmentLevel, SubscribeUpdate, type SubscribeRequest } from "@triton-one/yellowstone-grpc";
-import { DBC_PROGRAM_ID } from "./dbc";
+import { DBC_PROGRAM_ID, type DbcTx } from "./dbc";
 import { connection } from "./enrich";
 import { handleTransaction } from "./indexer";
 
@@ -27,13 +27,13 @@ function handleUpdate(update: SubscribeUpdate) {
   const message = info?.transaction?.message;
   if (!info?.meta || !message || info.meta.err) return;
   const meta = info.meta;
+  const accountKeys = [...message.accountKeys, ...meta.loadedWritableAddresses, ...meta.loadedReadonlyAddresses].map((k) => bs58.encode(k));
+  const dbc = accountKeys.indexOf(DBC_PROGRAM_ID);
+  const slot = Number(update.transaction!.slot);
   handleTransaction({
-    sig: bs58.encode(info.signature),
-    blockTime: slotTime(Number(update.transaction!.slot)),
-    accountKeys: [...message.accountKeys, ...meta.loadedWritableAddresses, ...meta.loadedReadonlyAddresses].map((k) => bs58.encode(k)),
-    instructions: message.instructions,
-    innerInstructions: meta.innerInstructions.flatMap((group) => group.instructions),
-  });
+    sig: bs58.encode(info.signature), slot, blockTime: slotTime(slot), accountKeys,
+    ixs: [...message.instructions, ...meta.innerInstructions.flatMap((group) => group.instructions)].filter((ix) => ix.programIdIndex === dbc),
+  }, "live");
 }
 
 const subscribeRequest: SubscribeRequest = {
@@ -68,17 +68,20 @@ export function streamMirage(subscriptionId: string, apiKey: string) {
   };
 }
 
-export function normalizeRpcTx(sig: string, tx: VersionedTransactionResponse) {
+// RPC getTransaction (jsonParsed-free "json" encoding) to DbcTx: DBC instructions only, top-level then CPIs.
+export function normalizeRpcTx(sig: string, tx: VersionedTransactionResponse): DbcTx {
   const keys = tx.transaction.message.getAccountKeys({ accountKeysFromLookups: tx.meta?.loadedAddresses });
   const lookups = keys.accountKeysFromLookups;
+  const accountKeys = [...keys.staticAccountKeys, ...(lookups?.writable ?? []), ...(lookups?.readonly ?? [])].map((k) => k.toBase58());
+  const dbc = accountKeys.indexOf(DBC_PROGRAM_ID);
   return {
-    sig,
-    blockTime: tx.blockTime ?? Math.floor(Date.now() / 1000),
-    accountKeys: [...keys.staticAccountKeys, ...(lookups?.writable ?? []), ...(lookups?.readonly ?? [])].map((k) => k.toBase58()),
-    instructions: tx.transaction.message.compiledInstructions.map((ix) => ({ programIdIndex: ix.programIdIndex, data: ix.data })),
-    innerInstructions: (tx.meta?.innerInstructions ?? []).flatMap((group) =>
-      group.instructions.map((ix) => ({ programIdIndex: ix.programIdIndex, data: utils.bytes.bs58.decode(ix.data) })),
-    ),
+    sig, slot: tx.slot, blockTime: tx.blockTime ?? Math.floor(Date.now() / 1000), accountKeys,
+    ixs: [
+      ...tx.transaction.message.compiledInstructions.map((ix) => ({ programIdIndex: ix.programIdIndex, accounts: ix.accountKeyIndexes, data: ix.data })),
+      ...(tx.meta?.innerInstructions ?? []).flatMap((group) =>
+        group.instructions.map((ix) => ({ programIdIndex: ix.programIdIndex, accounts: ix.accounts, data: bs58.decode(ix.data) })),
+      ),
+    ].filter((ix) => ix.programIdIndex === dbc),
   };
 }
 
@@ -98,7 +101,7 @@ export async function pollRpc(perPoll = 15, intervalMs = 3000) {
         // web3.js v1 can't parse v1 (SIMD-0385) transactions; skip those in the sampler.
         const tx = await connection.getTransaction(s.signature, { maxSupportedTransactionVersion: 0 }).catch(() => null);
         if (!tx?.meta) continue;
-        handleTransaction(normalizeRpcTx(s.signature, tx));
+        handleTransaction(normalizeRpcTx(s.signature, tx), "live");
         Object.assign(streamHealth, { updates: streamHealth.updates + 1, lastUpdateAt: Date.now(), slot: tx.slot });
       }
     } catch (e) {

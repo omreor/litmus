@@ -85,9 +85,83 @@ const INIT_POOL_IXS = new Set([
   "initialize_virtual_pool_with_token2022_transfer_hook",
 ]);
 
-export function decodeTokenMetadata(data: Uint8Array): { name: string; symbol: string; uri: string } | null {
-  const ix = instructionCoder.decode(Buffer.from(data));
-  return ix && INIT_POOL_IXS.has(ix.name) ? (ix.data as any).params : null;
+export const dbcIxName = (data: Uint8Array) => instructionCoder.decode(Buffer.from(data))?.name ?? null;
+
+const SWAP_IXS = new Set(["swap", "swap2", "swap2_with_transfer_hook"]);
+const SWAP_POOL = 2;
+const SWAP_PAYER = 9;
+const INIT_CREATOR = 2;
+const initPayer = new Map(
+  [...INIT_POOL_IXS].map((name) => [name, (idl as any).instructions.find((ix: any) => ix.name === name).accounts.findIndex((a: any) => a.name === "payer")]),
+);
+
+// A transaction reduced to its DBC instructions (top-level and CPI, events included) in execution order,
+// with account indices into accountKeys. Built from gRPC updates, RPC getTransaction results and the
+// .scratch/raw archive alike.
+export type DbcTx = { sig: string; slot: number; blockTime: number; accountKeys: string[]; ixs: { accounts: ArrayLike<number>; data: Uint8Array }[] };
+
+export type TokenMetadata = { name: string; symbol: string; uri: string };
+export type DbcStep =
+  | { kind: "launch"; pool: string; config: string; creator: string; mint: string; signer: string | null; meta?: TokenMetadata }
+  // quote: what the trader paid or received; net: the change in the pool's quote reserve (fees excluded)
+  | { kind: "swap"; pool: string; config: string; trader: string; buy: boolean; quote: bigint; net: bigint; reserve: bigint | null; threshold: bigint | null; ts: number }
+  | { kind: "complete"; pool: string; config: string; quoteReserve: bigint }
+  | { kind: "config"; config: string; feeClaimer: string; quoteMint: string };
+
+const QUOTE_TO_BASE = 1;
+const b58 = (v: { toBase58(): string }) => v.toBase58();
+
+// Events carry no trader: it's the payer of the swap instruction that emitted them, paired per pool in order.
+export function decodeDbcTx(tx: DbcTx): DbcStep[] {
+  const traders = new Map<string, string[]>();
+  const inits: { meta: TokenMetadata; signer: string | null }[] = [];
+  const events: DbcEvent[] = [];
+  for (const ix of tx.ixs) {
+    const event = decodeEventIx(ix.data);
+    if (event) {
+      events.push(event);
+      continue;
+    }
+    const decoded = instructionCoder.decode(Buffer.from(ix.data));
+    if (!decoded) continue;
+    const key = (i: number) => tx.accountKeys[ix.accounts[i]] ?? null;
+    if (SWAP_IXS.has(decoded.name)) {
+      const pool = key(SWAP_POOL);
+      if (pool) traders.set(pool, [...(traders.get(pool) ?? []), key(SWAP_PAYER) ?? tx.accountKeys[0]]);
+    } else if (INIT_POOL_IXS.has(decoded.name)) {
+      inits.push({ meta: (decoded.data as any).params, signer: key(initPayer.get(decoded.name)) ?? key(INIT_CREATOR) });
+    }
+  }
+  return events.flatMap(({ name, data: e }): DbcStep[] => {
+    switch (name) {
+      case "EvtInitializePool":
+      case "EvtInitializePoolWithTransferHook": {
+        const init = inits.shift();
+        return [{ kind: "launch", pool: b58(e.pool), config: b58(e.config), creator: b58(e.creator), mint: b58(e.base_mint), signer: init?.signer ?? null, meta: init?.meta }];
+      }
+      case "EvtSwap2":
+      case "EvtSwap2WithTransferHook":
+      case "EvtSwap": {
+        const pool = b58(e.pool);
+        const buy = e.trade_direction === QUOTE_TO_BASE;
+        const v2 = name !== "EvtSwap";
+        const quote = BigInt(buy ? (v2 ? e.swap_result.included_fee_input_amount : e.amount_in) : e.swap_result.output_amount);
+        const net = buy ? BigInt(v2 ? e.swap_result.excluded_fee_input_amount : e.swap_result.actual_input_amount) : -quote;
+        return [{
+          kind: "swap", pool, config: b58(e.config), trader: traders.get(pool)?.shift() ?? tx.accountKeys[0], buy, quote, net,
+          reserve: v2 ? BigInt(e.quote_reserve_amount) : null, threshold: v2 ? BigInt(e.migration_threshold) : null, ts: Number(e.current_timestamp),
+        }];
+      }
+      case "EvtCurveComplete":
+      case "EvtCurveCompleteWithTransferHook":
+        return [{ kind: "complete", pool: b58(e.pool), config: b58(e.config), quoteReserve: BigInt(e.quote_reserve) }];
+      case "EvtCreateConfig":
+      case "EvtCreateConfigV2":
+      case "EvtCreateConfigV2WithTransferHook":
+        return [{ kind: "config", config: b58(e.config), feeClaimer: b58(e.fee_claimer), quoteMint: b58(e.quote_mint) }];
+    }
+    return [];
+  });
 }
 
 const FEE_DENOMINATOR = 1e9;

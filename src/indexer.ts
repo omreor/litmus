@@ -1,66 +1,91 @@
-import { DBC_PROGRAM_ID, decodeEventIx, decodeTokenMetadata, type DbcEvent } from "./dbc";
+import { decodeDbcTx, type DbcTx } from "./dbc";
 import { queueConfig } from "./enrich";
+import { applyEvidence, firstSighting } from "./evidence";
+import { judgementOf, judgePool, launchpadLabel, verdictFields, type Signals } from "./integrity";
 import { cleanText } from "./metadata";
-import { recordGraduation, recordLaunch, recordSwap } from "./store";
+import { db, recordGraduation, recordLaunch, recordSwap } from "./store";
 
-export type FeedItem =
-  | { type: "launch"; ts: number; sig: string; pool: string; config: string; creator: string; mint: string; name?: string; symbol?: string; uri?: string }
-  | { type: "graduation"; ts: number; sig: string; pool: string; config: string; quoteReserve: string }
-  | { type: "config"; ts: number; sig: string; config: string; feeClaimer: string; quoteMint: string };
+type Verdict = Omit<ReturnType<typeof verdictFields>, "signals"> & { signals: Signals | null };
+type Common = { ts: number; sig: string; launchpad: { id: string; name: string | null } | null } & Verdict;
+export type FeedItem = Common & (
+  | { type: "launch"; pool: string; config: string; creator: string; mint: string; name?: string; symbol?: string; uri?: string }
+  | { type: "graduation"; pool: string; config: string; quoteReserve: string; name: string | null; symbol: string | null; mint: string | null }
+  | { type: "config"; config: string; feeClaimer: string; quoteMint: string }
+);
 
 const listeners = new Set<(item: FeedItem) => void>();
 export const subscribeFeed = (fn: (item: FeedItem) => void) => (listeners.add(fn), () => listeners.delete(fn));
-const emit = (item: FeedItem) => listeners.forEach((fn) => fn(item));
 
-const QUOTE_TO_BASE = 1;
-const key = (v: { toBase58(): string }) => v.toBase58();
-
-type TokenMetadata = { name: string; symbol: string; uri: string };
-
-export function handleEvent({ name, data: e }: DbcEvent, blockTime: number, sig: string, meta?: TokenMetadata) {
-  if (e.config) queueConfig(key(e.config));
-  switch (name) {
-    case "EvtInitializePool":
-    case "EvtInitializePoolWithTransferHook": {
-      const [pool, config, creator, mint] = [key(e.pool), key(e.config), key(e.creator), key(e.base_mint)];
-      recordLaunch(pool, config, creator, mint, blockTime, meta);
-      return emit({ type: "launch", ts: blockTime, sig, pool, config, creator, mint, ...meta });
-    }
-    case "EvtSwap2":
-    case "EvtSwap2WithTransferHook": {
-      const buy = e.trade_direction === QUOTE_TO_BASE;
-      const volume = buy ? e.swap_result.included_fee_input_amount : e.swap_result.output_amount;
-      return recordSwap({
-        pool: key(e.pool), config: key(e.config), buy, ts: Number(e.current_timestamp),
-        reserve: BigInt(e.quote_reserve_amount), threshold: BigInt(e.migration_threshold), volume: BigInt(volume),
-      });
-    }
-    case "EvtCurveComplete":
-    case "EvtCurveCompleteWithTransferHook": {
-      const [pool, config] = [key(e.pool), key(e.config)];
-      recordGraduation(pool, config, BigInt(e.quote_reserve), blockTime);
-      return emit({ type: "graduation", ts: blockTime, sig, pool, config, quoteReserve: e.quote_reserve.toString() });
-    }
-    case "EvtCreateConfig":
-    case "EvtCreateConfigV2":
-    case "EvtCreateConfigV2WithTransferHook":
-      return emit({
-        type: "config", ts: blockTime, sig, config: key(e.config), feeClaimer: key(e.fee_claimer), quoteMint: key(e.quote_mint),
-      });
-  }
+const configLaunchpad = db.prepare("SELECT launchpad FROM configs WHERE address = ?");
+export function launchpadOf(config: string) {
+  const id = (configLaunchpad.get(config) as { launchpad: string | null } | null)?.launchpad;
+  return id ? { id, name: launchpadLabel(id).name } : null;
 }
 
-type Ix = { programIdIndex: number; data: Uint8Array };
+const poolNames = db.prepare("SELECT name, symbol, base_mint FROM pools WHERE address = ?");
+export function graduationItem(pool: string, config: string, ts: number, sig: string, quoteReserve: string): FeedItem | null {
+  const judgement = judgementOf(pool);
+  if (!judgement) return null;
+  const p = poolNames.get(pool) as { name: string | null; symbol: string | null; base_mint: string | null };
+  return {
+    type: "graduation", ts, sig, pool, config, quoteReserve, name: p.name, symbol: p.symbol, mint: p.base_mint,
+    launchpad: launchpadOf(config), ...verdictFields(judgement),
+  };
+}
 
-// Source-agnostic: works for RPC getTransaction results and Yellowstone gRPC updates once both are
-// normalised to account keys + instruction data. The pool-init call can be top-level or a CPI from a
-// launchpad program; its name/symbol/uri args get paired with the launch event of the same tx.
-export function handleTransaction(tx: { sig: string; blockTime: number; accountKeys: string[]; instructions: Ix[]; innerInstructions: Ix[] }) {
-  const dbc = [...tx.instructions, ...tx.innerInstructions].filter((ix) => tx.accountKeys[ix.programIdIndex] === DBC_PROGRAM_ID);
-  const events = dbc.map((ix) => decodeEventIx(ix.data)).filter((e) => e !== null);
-  const metadata = dbc.map((ix) => (events.length ? decodeTokenMetadata(ix.data) : null)).filter((m) => m !== null);
-  for (const event of events) {
-    const meta = event.name.startsWith("EvtInitializePool") ? metadata.shift() : undefined;
-    handleEvent(event, tx.blockTime, tx.sig, meta && { name: cleanText(meta.name), symbol: cleanText(meta.symbol), uri: meta.uri });
+// Pools whose evidence changed since they were last judged; re-judged in batches (flushVerdicts).
+const dirty = new Set<string>();
+export function flushVerdicts() {
+  const pools = [...dirty];
+  dirty.clear();
+  db.transaction(() => pools.forEach((pool) => judgePool(pool))).immediate();
+}
+
+// Source-agnostic: the live stream, the archive replay and the RPC sampler all deliver DbcTx. Each
+// transaction is applied once (store counters, evidence); feed items go out only for live ones, after
+// the whole transaction is applied so a launch's verdict sees the creator's buy in the same transaction.
+export function handleTransaction(tx: DbcTx, source: "live" | "archive") {
+  if (!firstSighting(tx.sig, tx.slot)) return;
+  const steps = decodeDbcTx(tx);
+  db.transaction(() => {
+    for (const step of steps) {
+      queueConfig(step.config);
+      if (step.kind === "launch") {
+        const meta = step.meta && { name: cleanText(step.meta.name), symbol: cleanText(step.meta.symbol), uri: step.meta.uri };
+        recordLaunch(step.pool, step.config, step.creator, step.mint, tx.blockTime, meta);
+      } else if (step.kind === "swap") {
+        if (step.reserve !== null && step.threshold !== null)
+          recordSwap({ pool: step.pool, config: step.config, buy: step.buy, ts: step.ts, reserve: step.reserve, threshold: step.threshold, volume: step.quote });
+        dirty.add(step.pool);
+      } else if (step.kind === "complete") recordGraduation(step.pool, step.config, step.quoteReserve, tx.blockTime);
+      applyEvidence(tx, step, source);
+    }
+  }).immediate();
+  for (const step of steps) {
+    if (step.kind === "swap") continue;
+    let item: FeedItem | null;
+    if (step.kind === "config") {
+      if (source !== "live") continue;
+      item = {
+        type: "config", ts: tx.blockTime, sig: tx.sig, config: step.config, feeClaimer: step.feeClaimer, quoteMint: step.quoteMint,
+        launchpad: { id: step.feeClaimer, name: launchpadLabel(step.feeClaimer).name },
+        verdict: "unverified", contested: null, organic: true, evidence: {}, signals: null, receipts: [], reasons: [],
+      };
+    } else if (step.kind === "launch") {
+      const judgement = judgePool(step.pool);
+      dirty.delete(step.pool);
+      if (source !== "live" || !judgement) continue;
+      const p = poolNames.get(step.pool) as { name: string | null; symbol: string | null };
+      item = {
+        type: "launch", ts: tx.blockTime, sig: tx.sig, pool: step.pool, config: step.config, creator: step.creator, mint: step.mint,
+        name: p.name ?? undefined, symbol: p.symbol ?? undefined, uri: step.meta?.uri, launchpad: launchpadOf(step.config), ...verdictFields(judgement),
+      };
+    } else {
+      dirty.delete(step.pool);
+      judgePool(step.pool);
+      if (source !== "live") continue;
+      item = graduationItem(step.pool, step.config, tx.blockTime, tx.sig, step.quoteReserve.toString());
+    }
+    if (item) listeners.forEach((fn) => fn(item));
   }
 }
