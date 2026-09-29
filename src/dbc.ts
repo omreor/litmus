@@ -12,6 +12,61 @@ const eventCoder = new BorshEventCoder(idl as any);
 const instructionCoder = new BorshInstructionCoder(idl as any);
 export const accountsCoder = new BorshAccountsCoder(idl as any);
 
+const bs58 = utils.bytes.bs58;
+const pubkeyAt = (b: Buffer, o: number) => bs58.encode(b.subarray(o, o + 32));
+
+// Byte ranges the backfill downloads (getProgramAccounts dataSlice). Readers take account offsets.
+// ConfigWithTransferHook embeds PoolConfig at offset 8 and TransferHookPool embeds the pool state the
+// same way, so one slice layout serves both kinds.
+export const CONFIG_SLICE = { offset: 8, length: 264 }; // quote_mint .. migration_quote_threshold
+export const POOL_SLICE = { offset: 72, length: 280 }; // config .. finish_curve_timestamp
+
+export function readConfigSlice(s: Buffer) {
+  const at = (offset: number) => offset - CONFIG_SLICE.offset;
+  return {
+    quoteMint: pubkeyAt(s, at(8)),
+    feeClaimer: pubkeyAt(s, at(40)),
+    leftoverReceiver: pubkeyAt(s, at(72)),
+    threshold: Number(s.readBigUInt64LE(at(264))),
+    cliffFeeBps: Math.round(Number(s.readBigUInt64LE(at(104))) / 1e5), // numerator / 1e9 * 1e4
+    baseFeeMode: s[at(130)],
+    dynamicFee: s[at(136)],
+    collectFeeMode: s[at(232)],
+    migrationOption: s[at(233)],
+    activationType: s[at(234)],
+    tokenDecimals: s[at(235)],
+    tokenType: s[at(237)],
+    migrationFeeOption: s[at(243)],
+    creatorFeePct: s[at(245)],
+  };
+}
+export type ConfigFields = ReturnType<typeof readConfigSlice>;
+
+// Template = the launch terms that matter for outcomes, ignoring who owns the config and per-token
+// curve amounts. Thresholds are rounded to 2 significant digits so near-identical copies
+// (10.95 vs 11.2 SOL) group together.
+export function templateOf(c: ConfigFields) {
+  const fingerprint = [
+    c.quoteMint, c.threshold ? Number(c.threshold.toPrecision(2)) : 0, c.cliffFeeBps, c.baseFeeMode, c.migrationOption,
+    c.migrationFeeOption, c.collectFeeMode, c.creatorFeePct, c.tokenType, c.tokenDecimals, c.activationType, c.dynamicFee,
+  ];
+  return new Bun.CryptoHasher("sha256").update(JSON.stringify(fingerprint)).digest("hex").slice(0, 12);
+}
+
+export function readPoolSlice(s: Buffer) {
+  const at = (offset: number) => offset - POOL_SLICE.offset;
+  return {
+    config: pubkeyAt(s, at(72)),
+    creator: pubkeyAt(s, at(104)),
+    baseMint: pubkeyAt(s, at(136)),
+    quoteReserve: s.readBigUInt64LE(at(240)),
+    activationPoint: Number(s.readBigUInt64LE(at(296))),
+    // metrics.total_protocol_quote_fee + total_trading_quote_fee (lifetime, quote side only)
+    feesQuote: s.readBigUInt64LE(at(320)) + s.readBigUInt64LE(at(336)),
+    finishedAt: Number(s.readBigUInt64LE(at(344))),
+  };
+}
+
 // Anchor emit_cpi! prefixes the event with this 8-byte tag (sha256("anchor:event")[..8]).
 const EVENT_IX_TAG = Buffer.from([0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d]);
 

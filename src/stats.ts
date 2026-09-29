@@ -36,6 +36,7 @@ export function families(since: number, limit = 50) {
       COUNT(p.address) FILTER (WHERE p.created_at >= $since AND p.graduated_at IS NOT NULL) launched_graduated,
       COUNT(p.address) FILTER (WHERE p.graduated_at >= $since) graduations
     FROM configs c LEFT JOIN pools p ON p.config = c.address
+    WHERE c.family IS NOT NULL -- backfilled configs are only described once seen live
     GROUP BY c.family HAVING launches + graduations > 0
     ORDER BY launches DESC LIMIT $limit`)
     .all({ $since: since, $limit: limit }) as any[];
@@ -132,7 +133,7 @@ const THRESHOLD_BUCKETS = [0, 5, 15, 40, 80, 150, Infinity];
 // Graduation outcomes of SOL-quoted launches we saw, bucketed by the config's migration threshold.
 export function thresholdBenchmarks(since: number) {
   const rows = db
-    .query(`SELECT json_extract(c.info, '$.migrationThreshold') threshold, p.graduated_at - p.created_at secs
+    .query(`SELECT c.threshold / 1e9 threshold, p.graduated_at - p.created_at secs
       FROM pools p JOIN configs c ON c.address = p.config
       WHERE p.created_at >= $since AND c.quote_mint = $sol`)
     .all({ $since: since, $sol: SOL }) as { threshold: number; secs: number | null }[];

@@ -1,6 +1,6 @@
 import { Connection, PublicKey } from "@solana/web3.js";
-import { describeConfig } from "./dbc";
-import { db } from "./store";
+import { CONFIG_SLICE, describeConfig, readConfigSlice } from "./dbc";
+import { db, saveConfig } from "./store";
 
 const { RPC_URL, SOLAMI_API_KEY } = process.env;
 export const connection = new Connection(
@@ -20,10 +20,9 @@ async function mintDecimals(mint: string) {
   return decimals.get(mint)!;
 }
 
-const isKnown = db.prepare("SELECT 1 FROM configs WHERE address = ?");
-const insertConfig = db.prepare(
-  "INSERT OR REPLACE INTO configs (address, fee_claimer, quote_mint, family, info, data) VALUES (?, ?, ?, ?, ?, ?)",
-);
+// Backfilled configs only carry the fingerprint columns; full data is fetched once one shows up live.
+const isKnown = db.prepare("SELECT 1 FROM configs WHERE address = ? AND data IS NOT NULL");
+const describe = db.prepare("UPDATE configs SET family = ?, info = ?, data = ? WHERE address = ?");
 
 const pending = new Set<string>();
 export function queueConfig(address: string) {
@@ -37,10 +36,11 @@ export async function flushConfigs() {
   const infos = await connection.getMultipleAccountsInfo(batch.map((a) => new PublicKey(a)));
   for (const [i, info] of infos.entries()) {
     if (!info) continue;
-    const quoteMint = new PublicKey(info.data.subarray(8, 40)).toBase58();
+    const fields = readConfigSlice(info.data.subarray(CONFIG_SLICE.offset, CONFIG_SLICE.offset + CONFIG_SLICE.length));
     try {
-      const { curve, ...d } = describeConfig(info.data, await mintDecimals(quoteMint));
-      insertConfig.run(batch[i], d.feeClaimer, quoteMint, d.family, JSON.stringify({ ...d, curve }), info.data);
+      saveConfig(batch[i], fields);
+      const { curve, ...d } = describeConfig(info.data, await mintDecimals(fields.quoteMint));
+      describe.run(d.family, JSON.stringify({ ...d, curve }), info.data, batch[i]);
     } catch (e) {
       console.error("config decode failed", batch[i], e);
     }
@@ -53,7 +53,7 @@ const DESCRIBE_VERSION = 2;
 export async function redescribeConfigs() {
   const { user_version } = db.query("PRAGMA user_version").get() as { user_version: number };
   if (user_version === DESCRIBE_VERSION) return;
-  const rows = db.query("SELECT address, quote_mint, data FROM configs").all() as { address: string; quote_mint: string; data: Uint8Array }[];
+  const rows = db.query("SELECT address, quote_mint, data FROM configs WHERE data IS NOT NULL").all() as { address: string; quote_mint: string; data: Uint8Array }[];
   const update = db.prepare("UPDATE configs SET family = ?, info = ? WHERE address = ?");
   for (const row of rows) {
     try {
