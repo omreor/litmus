@@ -248,7 +248,7 @@ function Radar({ windowSeconds, hideUncontested }: { windowSeconds: number; hide
         />
         <Tile
           label="Volume" value={overview ? `${compact(volumeSol)} SOL` : "–"}
-          sub={overview?.solUsd ? `≈ $${compact(volumeSol * overview.solUsd)} · ${compact(solVolume?.trades ?? 0)} trades, all pools` : ""}
+          sub={overview?.solUsd ? `≈ $${compact(volumeSol * overview.solUsd)} · ${compact(solVolume?.trades ?? 0)} trades, all pools${overview.volumeFrom ? ` since ${new Date(overview.volumeFrom * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}` : ""}` : ""}
         />
         <Tile label="Active pools" value={overview ? compact(overview.active) : "–"} sub="traded in window, all pools" />
       </div>
@@ -371,7 +371,7 @@ function Launchpads({ windowSeconds, hideUncontested }: { windowSeconds: number;
       <p className="caption">
         Ranked by contested graduations{windowed ? " in the window" : " since April 2025"}. Launchpads are identified from on-chain partner metadata,
         Jupiter's launchpad labels and the wallets behind their configs; one without a public name shows as "Unlabeled launchpad" and its address.
-        Graduation rate and median time to graduate are all-time, with uncontested pools left out
+        Graduation rate is all-time with uncontested pools left out; median time to graduate is all-time over contested graduations
         {hasPost ? "; alive at 7d is the share of graduated pools whose DAMM v2 pool still had liquidity and volume a week later" : ""}.
         Uncontested share: the launchpad's pools <a href="#integrity">judged uncontested</a>.
       </p>
@@ -446,7 +446,7 @@ function Templates({ windowSeconds, hideUncontested, onFork }: { windowSeconds: 
         <p className="caption">
           Configs grouped by parameter template: quote, threshold, fees, LP split and migration. Launchpads mint a config per token, so the
           template is the real preset. Ranked by graduation rate with uncontested pools left out; templates with under {MIN_SAMPLE} pools in the
-          window come last. Median time to graduate leaves out uncontested graduations. A template's Uncontested badge comes from its history:
+          window come last. Median time to graduate is over contested graduations. A template's Uncontested badge comes from its history:
           each pool is still judged on its own evidence.
         </p>
         <div className={poll.stale ? "table-scroll stale" : "table-scroll"}>
@@ -516,7 +516,7 @@ function TemplateDetail({ detail, row, onFork }: { detail: any; row: any; onFork
             <p className="caption">
               {row.launchpad ? launchpadName(row.launchpad) : "No launchpad identified"} · {num(row.pools, 0)} pools in window ·{" "}
               {pct(row.gradRate, 1)} graduated, {pct(row.organicGradRate, 1)} with uncontested pools excluded · median{" "}
-              {duration(row.medianSecondsToGraduate)} to graduate, uncontested excluded
+              {duration(row.medianSecondsToGraduate)} to graduate over contested graduations
             </p>
           </div>
           <button className="btn" onClick={() => onFork({ address: lead.address, label: detail.label, info, quoteSymbol: row.quote?.symbol })}>Fork with priors</button>

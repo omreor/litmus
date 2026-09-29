@@ -10,7 +10,7 @@ About 3,100 DBC bonding curves complete every day. Raw chain stats, DefiLlama an
 - **uncontested**: a rule fired, the curve was filled without real competition (the creator or one bundle filled it, it completed in its creation slot, the threshold was trivial, or it sits on an auto-completing template);
 - **unverified**: no rule fired, but the transactions that would confirm competition haven't been replayed yet.
 
-Every verdict ships with **receipts**: the evidence values and the transaction signatures behind it. As of 2026-09-29, of about 94,000 graduations in the last 30 days, roughly 360 were contested, 240 unverified and the rest uncontested; since April 2025, 98.9% of 919,619 graduations were uncontested.
+Every verdict ships with **receipts**: the evidence values and the transaction signatures behind it. As of 2026-09-29 15:43 UTC, of 94,332 graduations in the last 30 days, 495 were contested, 68 unverified and 93,769 uncontested; since April 2025, 909,994 of 920,078 graduations (98.9%) were uncontested (`/api/overview?window=2592000`, `/api/integrity/monthly`).
 
 "Graduation" means the curve completed (`finish_curve_timestamp`). Migration to DAMM v2 is a separate step.
 
@@ -39,6 +39,23 @@ The rules, with their thresholds and version, are served by `GET /api/rules` and
 
 Launchpad identity is the config's fee claimer, except for pads that mint a claimer per token (Bags: their shared leftover receiver) or rotate claimers per config (Perpspad: the wallet that created the config). Names come from a curated table, then Jupiter's `launchpad` label, then on-chain `PartnerMetadata`.
 
+## Accuracy
+
+Verdicts (rules v3) were re-checked one by one against each pool's own transactions on 2026-09-29 by an AI agent on the team (a self-review, not an independent audit): a random sample of graduations from the previous 30 days, every transaction re-read from mainnet rather than taken from Litmus' stored evidence, every pool linked and every disagreement kept.
+
+| Verdict | Reviewed | Agree | Disagree | Precision (95% CI) |
+|---|---|---|---|---|
+| Uncontested | 34 | 34 | 0 | 100% (90% to 100%) |
+| Contested | 32 | 27 | 4 (1 can't tell) | 87% (71% to 95%) |
+| Unverified | 23 | - | - | no claim; by hand 17 were contested, 6 uncontested |
+| Funded swarm (rule check) | 8 | 8 | 0 | 8 of 8 |
+
+Precision = agree / (agree + disagree), Wilson interval.
+
+- Read uncontested as safe to cite and contested as an upper bound, off by about one in eight. Every miss had the same shape: one party supplied most of the curve in a way the rules don't catch yet (wallet clusters funded more than a day before they bought; one dominant non-creator buyer).
+- The sample is small and the reviewer is the Litmus data engineer (an AI agent), not an independent third party. Judgment calls are counted as labeled.
+- Every reviewed pool, its hand label, what its transactions show and its receipts: [PRECISION.md](PRECISION.md).
+
 ## Run it
 
 Requires [Bun](https://bun.sh) 1.3+ and, for real data, a [Solami](https://solami.dev) API key.
@@ -58,7 +75,8 @@ Open http://localhost:3000. Bun also reads variables from a `.env` file in the r
 | `RPC_URL` | Solami RPC with a key, else `https://solana-rpc.publicnode.com` | RPC for account lookups and sending transactions. |
 | `DB_PATH` | `litmus.sqlite` | SQLite file. |
 | `PORT` | `3000` | HTTP port. |
-| `PUBLIC_URL` | `http://localhost:3000` | Public origin used in metadata URIs of tokens launched from the Studio. |
+| `META_URL` | `https://omreor.github.io/litmus/data/meta/` | Base URL of the metadata (`<mint>.json`) of tokens launched from the Studio; it goes into the token's on-chain URI. The server runs `scripts/publish.sh meta` on every launch to publish it there. |
+| `ARCHIVE_DIR` | `.scratch/raw` | Where `record.ts` archives transactions; the server replays it on start and every 5 minutes. |
 
 A fresh database only holds what the server streams from the moment it starts. Load history with:
 
@@ -74,7 +92,7 @@ SOLAMI_API_KEY=sk_... bun src/record.ts .scratch/raw                         # a
 The full backfill uses `getProgramAccounts` on public mainnet-beta (sharded, about 4 minutes for pools); block times always come from mainnet-beta. Solami serves `getTransaction` for about the last 60 days, so replay only reaches pools created in that window. The server replays the archive written by `record.ts` on start and every 5 minutes.
 
 Notes:
-- **The Studio sends real mainnet transactions** from your wallet; a config costs about 0.01 SOL in rent. Set `PUBLIC_URL`, or tokens you launch point their metadata at localhost.
+- **The Studio sends real mainnet transactions** from your wallet; a config costs about 0.01 SOL in rent. If you host your own, set `META_URL` to where you serve token metadata (and `REMOTE` for `scripts/publish.sh`), or tokens you launch point at the live site's metadata folder.
 - Type-check with `bunx tsc --noEmit`; tests with `bun test`.
 
 ### Hosting it like the live site
@@ -84,6 +102,8 @@ scripts/run-live.sh        # server on :3300, Cloudflare quick tunnel, caffeinat
 scripts/run-live.sh stop
 scripts/publish.sh         # one publish: static UI + JSON snapshots + live.json, force-pushed to the gh-pages branch
 ```
+
+Script env: `PORT` (3300), `DB_PATH`, `CLOUDFLARED`; `publish.sh` also reads `API` (http://localhost:3300), `REMOTE` (the gh-pages remote), `OUT` and `METRICS`.
 
 The page reads `live.json`, probes the tunnel's `/api/health` for 3 s and goes live; otherwise it renders the snapshots in `data/` with a "snapshot as of" banner, and the feed and the Studio pause.
 
