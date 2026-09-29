@@ -11,11 +11,22 @@ import { db } from "./store";
 
 const now = () => Math.floor(Date.now() / 1000);
 
+// Volume is counted from the live stream only (config_hourly): windows reaching back before its first
+// hour cover less, and say so. The first hour never changes once there is one.
+let volumeStart: number | null = null;
+function firstVolumeHour() {
+  if (volumeStart === null) {
+    const { first } = db.query("SELECT MIN(hour) first FROM config_hourly").get() as { first: number | null };
+    volumeStart = first === null ? null : first * 3600;
+  }
+  return volumeStart;
+}
+
 export function overview(since: number) {
-  const launches = db.query(`SELECT COUNT(*) launches, COALESCE(SUM(verdict IS NOT 0), 0) organic, COALESCE(SUM(verdict = 1), 0) contested
-    FROM pools WHERE created_at >= ?`).get(since) as any;
-  const graduations = db.query(`SELECT COUNT(*) graduations, COALESCE(SUM(verdict IS NOT 0), 0) organic, COALESCE(SUM(verdict = 1), 0) contested
-    FROM pools WHERE graduated_at >= ?`).get(since) as any;
+  const launches = db.query(`SELECT COUNT(*) launches, COALESCE(SUM(verdict IS NOT 0), 0) organic, COALESCE(SUM(verdict = 1), 0) contested,
+      COALESCE(SUM(verdict = 0), 0) uncontested FROM pools WHERE created_at >= ?`).get(since) as any;
+  const graduations = db.query(`SELECT COUNT(*) graduations, COALESCE(SUM(verdict IS NOT 0), 0) organic, COALESCE(SUM(verdict = 1), 0) contested,
+      COALESCE(SUM(verdict = 0), 0) uncontested FROM pools WHERE graduated_at >= ?`).get(since) as any;
   const { active } = db.query("SELECT COUNT(*) active FROM pools WHERE last_trade_at >= ?").get(since) as any;
   // Live volume per quote token, and how much of it traded on volume-farm templates (1 bps, never graduate).
   const volume = db.query(`SELECT c.quote_mint mint, m.symbol, COALESCE(m.decimals, 9) decimals, SUM(h.volume) volume, SUM(h.trades) trades,
@@ -23,12 +34,15 @@ export function overview(since: number) {
     FROM config_hourly h JOIN configs c ON c.address = h.config LEFT JOIN mints m ON m.mint = c.quote_mint LEFT JOIN templates t ON t.template = c.template
     WHERE h.hour >= ? GROUP BY c.quote_mint ORDER BY volume DESC`).all(Math.floor(since / 3600)) as any[];
   const sol = volume.find((v) => v.mint === "So11111111111111111111111111111111111111112");
+  const start = firstVolumeHour();
   return {
     launches: launches.launches, graduations: graduations.graduations, active,
     organic: { launches: launches.organic, graduations: graduations.organic },
     contested: { launches: launches.contested, graduations: graduations.contested },
+    uncontested: { launches: launches.uncontested, graduations: graduations.uncontested },
     volume: volume.map(({ farmVolume, ...v }) => ({ ...v, symbol: quote(v.mint).symbol })),
     volumeFarm: { solVolume: sol?.farmVolume ?? 0, solShare: sol?.volume ? sol.farmVolume / sol.volume : null },
+    volumeFrom: start === null ? null : Math.max(start, since),
   };
 }
 

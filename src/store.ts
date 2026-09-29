@@ -2,7 +2,8 @@ import { Database } from "bun:sqlite";
 import { templateOf, type ConfigFields } from "./dbc";
 
 export const db = new Database(process.env.DB_PATH ?? "litmus.sqlite", { create: true });
-db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 30000;");
+// busy_timeout first: switching to WAL waits too when another process is recovering the log.
+db.exec("PRAGMA busy_timeout = 30000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
 db.exec(`
 CREATE TABLE IF NOT EXISTS pools (
   address TEXT PRIMARY KEY,
@@ -149,7 +150,17 @@ CREATE TABLE IF NOT EXISTS studio_txs (signature TEXT PRIMARY KEY, kind TEXT NOT
 `);
 addColumns("post_graduation", ["liquidity REAL", "fees_a REAL", "fees_b REAL"]);
 // partial = only the creation slot was replayed: fills are exact, buyer and volume counts are not.
-addColumns("pool_evidence", ["partial INTEGER NOT NULL DEFAULT 0"]);
+addColumns("pool_evidence", ["partial INTEGER NOT NULL DEFAULT 0", "version INTEGER"]);
+// Quote bought and the first buy (slot, transaction), per buyer (evidence version 2 on).
+addColumns("pool_buyers", ["volume INTEGER NOT NULL DEFAULT 0", "slot INTEGER", "sig TEXT"]);
+// Funding-source check of contested graduations (funding.ts): the common funder behind the largest share
+// of the sampled buyers' volume, if any (hops: 1 = funded the buyers, 2 = funded their funders).
+db.exec(`CREATE TABLE IF NOT EXISTS pool_funding (
+  pool TEXT PRIMARY KEY, version INTEGER NOT NULL, at INTEGER NOT NULL, sampled INTEGER NOT NULL, traced INTEGER NOT NULL,
+  funder TEXT, hops INTEGER, buyers INTEGER NOT NULL, share REAL NOT NULL, creator INTEGER NOT NULL, receipts TEXT NOT NULL
+)`);
+// share: of the sampled buyers' volume, pool_share: of all buy volume; cosigned: the funder also signed the buys it funded.
+addColumns("pool_funding", ["cosigned INTEGER NOT NULL DEFAULT 0", "pool_share REAL NOT NULL DEFAULT 0"]);
 
 // A pool can already exist from an earlier swap/graduation row if events arrive out of order.
 const insertPool = db.prepare(`

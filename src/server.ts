@@ -1,11 +1,13 @@
 import homepage from "../web/index.html";
 import { benchmarkBuckets, launchpads, launchpadsAllTime, monthly, QUOTE_MINTS, similar, templateDetail, templates, WINDOWS } from "./aggregates";
-import { replayArchive } from "./archive";
+import { rebuildEvidence, replayArchive } from "./archive";
 import { describeNow, flushConfigs, queueConfig, redescribeConfigs } from "./enrich";
+import { checkFundingBatch } from "./funding";
 import { flushVerdicts, subscribeFeed } from "./indexer";
 import { judgeAll, RULES, RULES_VERSION, rulesStale } from "./integrity";
 import { sweepMetadata, sweepQuotes } from "./metadata";
-import { readHistory, snapshotGraduations } from "./postgrad";
+import { outcomesByVerdict, readHistory, snapshotGraduations } from "./postgrad";
+import { replay } from "./replay";
 import { configDetail, graduationsRecent, hotPools, overview, poolDetail, usage } from "./stats";
 import { db } from "./store";
 import { pollRpc, streamGrpc, streamHealth, streamMirage } from "./stream";
@@ -40,8 +42,10 @@ setInterval(() => {
   }).immediate();
 }, 60_000);
 
-// GET routes are open to other sites (CORS) and counted.
+// Every route is open to other sites (CORS: the UI on GitHub Pages calls the API through the tunnel);
+// GET routes are counted.
 const CORS = { "access-control-allow-origin": "*" };
+const PREFLIGHT = { ...CORS, "access-control-allow-methods": "GET, POST, OPTIONS", "access-control-allow-headers": "content-type", "access-control-max-age": "86400" };
 const json = (body: unknown, status = 200) => Response.json(body, { status, headers: CORS });
 const notFound = (what: string) => json({ error: `unknown ${what}` }, 404);
 type Req = Request & { params: Record<string, string> };
@@ -58,10 +62,29 @@ const get = (route: string, fn: (req: Req, url: URL) => unknown) => async (req: 
 
 async function handle(req: Request, fn: (body: any) => unknown) {
   try {
-    return Response.json(await fn(await req.json()));
+    return json(await fn(await req.json()));
   } catch (e) {
-    return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 422 });
+    return json({ error: e instanceof Error ? e.message : String(e) }, 422);
   }
+}
+const post = (fn: (body: any) => unknown) => ({
+  POST: (req: Request) => handle(req, fn),
+  OPTIONS: () => new Response(null, { status: 204, headers: PREFLIGHT }),
+});
+
+// A Studio token's metadata must resolve at its Pages URL (tx.ts META_URL) by the time the launch lands:
+// published as soon as the launch is prepared, one run at a time, requests made meanwhile coalesced.
+let publishing = false;
+let publishAgain = false;
+async function publishMeta() {
+  if (publishing) return void (publishAgain = true);
+  publishing = true;
+  do {
+    publishAgain = false;
+    const proc = Bun.spawn(["scripts/publish.sh", "meta"], { stdout: "ignore", stderr: "pipe" });
+    if (await proc.exited) console.error("token metadata publish failed:", (await new Response(proc.stderr).text()).trim().slice(-300));
+  } while (publishAgain);
+  publishing = false;
 }
 
 // Full-history aggregates come from a Worker (aggregates.ts) that recomputes them on a timer; requests
@@ -122,6 +145,7 @@ const server = Bun.serve({
     "/": homepage,
     "/api/overview": get("overview", (_, url) => ({ ...overview(since(url)), solUsd })),
     "/api/integrity/monthly": get("integrity/monthly", () => computed("monthly", monthly, 600_000)),
+    "/api/integrity/postgrad": get("integrity/postgrad", () => computed("postgrad", () => outcomesByVerdict(), 600_000)),
     "/api/launchpads": get("launchpads", (_, url) => launchpadRows(url)),
     "/api/templates": get("templates", (_, url) => templateRows(url)),
     "/api/templates/:id": get("templates/:id", async (req) => (await templateById(req.params.id)) ?? notFound("template")),
@@ -136,21 +160,24 @@ const server = Bun.serve({
     "/api/rules": get("rules", () => ({ version: RULES_VERSION, rules: RULES })),
     "/api/usage": get("usage", () => usage(stream)),
     "/api/health": get("health", () => streamHealth),
-    "/api/studio/build": { POST: (req) => handle(req, buildStudio) },
-    "/api/studio/deploy": { POST: (req) => handle(req, (b) => createConfigTx(b.input, b.wallet)) },
-    "/api/studio/launch": { POST: (req) => handle(req, createPoolTx) },
-    "/api/tx/send": {
-      POST: (req) => handle(req, async (b) => {
-        const signature = await sendSigned(b.tx);
-        const action = studioAction(b.tx);
-        if (action) db.query("INSERT OR IGNORE INTO studio_txs (signature, kind, at, account) VALUES (?, ?, ?, ?)")
-          .run(signature, action.kind, Math.floor(Date.now() / 1000), action.account);
-        return { signature };
-      }),
-    },
+    "/api/studio/build": post(buildStudio),
+    "/api/studio/deploy": post((b) => createConfigTx(b.input, b.wallet)),
+    "/api/studio/launch": post(async (b) => {
+      const prepared = await createPoolTx(b);
+      publishMeta();
+      return prepared;
+    }),
+    "/api/tx/send": post(async (b) => {
+      const signature = await sendSigned(b.tx);
+      const action = studioAction(b.tx);
+      if (action) db.query("INSERT OR IGNORE INTO studio_txs (signature, kind, at, account) VALUES (?, ?, ?, ?)")
+        .run(signature, action.kind, Math.floor(Date.now() / 1000), action.account);
+      return { signature };
+    }),
+    // Metadata of tokens launched before it moved to GitHub Pages.
     "/api/meta/:mint": (req) => {
-      const json = tokenMeta(req.params.mint);
-      return json ? new Response(json, { headers: { "content-type": "application/json", ...CORS } }) : Response.json({}, { status: 404 });
+      const meta = tokenMeta(req.params.mint);
+      return meta ? new Response(meta, { headers: { "content-type": "application/json", ...CORS } }) : json({}, 404);
     },
     "/api/stream": (req, srv) => {
       hits.set("stream", (hits.get("stream") ?? 0) + 1);
@@ -185,16 +212,30 @@ function every(ms: number, name: string, fn: () => Promise<unknown> | unknown) {
 }
 
 await redescribeConfigs();
-if (rulesStale()) console.log("rules changed, re-judged", judgeAll());
 console.log("archive catch-up", replayArchive());
+// Before the stream starts: see rebuildEvidence.
+const rebuilt = rebuildEvidence();
+if (rebuilt) console.log("evidence rebuilt from the archive", rebuilt);
+if (rulesStale()) console.log("rules changed, re-judged", judgeAll());
 subscribeFeed((item) => server.publish("feed", JSON.stringify(item)));
 every(2000, "enrich", flushConfigs);
 every(2000, "metadata", sweepMetadata);
 every(600_000, "quotes", sweepQuotes);
 every(10_000, "verdicts", flushVerdicts);
 every(600_000, "post-graduation", snapshotGraduations);
-// Re-reads every graduated pool twice a day, so "still trading" compares two reads.
-every(43_200_000, "post-graduation history", () => readHistory());
+// Re-reads every graduated pool twice a day, so "still trading" compares two reads: checked every half
+// hour for reads older than 12 h, so restarts never push the re-read back.
+every(1_800_000, "post-graduation history", () => readHistory());
+// Pools trading right now that were created before we watched them get their history replayed, closest
+// to graduation first; new contested graduations get their funding-source check.
+every(60_000, "hot replay", async () => {
+  const done = await replay("hot", 58, 8);
+  if (done.pools) console.log("hot replay", done);
+});
+every(300_000, "funding", async () => {
+  const done = await checkFundingBatch(10);
+  if (done.checked || done.errors) console.log("funding check", done);
+});
 // Picks up what src/record.ts archived while this server was down or its stream reconnected.
 every(300_000, "archive", replayArchive);
 sweepQuotes().catch((e) => console.error("quotes", e));

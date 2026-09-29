@@ -1,15 +1,19 @@
 import { utils } from "@coral-xyz/anchor";
 import { DBC_PROGRAM_ID, decodeDbcTx, type DbcTx } from "./dbc";
-import { applyEvidence, resetEvidence } from "./evidence";
-import { judgePool } from "./integrity";
+import { applyEvidence, EVIDENCE_VERSION, resetEvidence } from "./evidence";
+import { assignLaunchpads, judgePool, OPERATOR_KEYS } from "./integrity";
 import { db } from "./store";
 
-// History replay over Solami RPC: rebuilds a graduated pool's evidence from its own transactions.
+// History replay over Solami RPC: rebuilds a pool's evidence from its own transactions.
 //   full:     every transaction of the pool (the contested candidates: no rule fired, no evidence yet)
 //   creation: only the creation slot (creator and bundle fill, same-slot completion) for all graduations
+//   hot:      every transaction of pools trading right now without evidence, closest to graduation first
+//             (the server runs this every minute so the Radar's pools get verdicts)
+//   redo:     pools replayed with an older EVIDENCE_VERSION, again with their original scope
+// `bun src/replay.ts operators` attributes the configs whose creation an operator key co-signed.
 // Solami serves getTransaction for roughly the last 60 days (older requests time out after 40 s), so
 // only pools created inside that window are attempted. Resumable: `replays` records every attempt.
-// Usage: bun src/replay.ts full|creation [days=58] [limit]
+// Usage: bun src/replay.ts full|creation|hot|redo [days=58] [limit]
 
 const bs58 = utils.bytes.bs58;
 const SOLAMI_RPC = `https://rpc.solami.dev/sol?api_key=${process.env.SOLAMI_API_KEY}`;
@@ -57,8 +61,8 @@ async function post(calls: Call[]): Promise<Reply[]> {
   }
 }
 
-// Batched calls; failed ones are retried (as smaller batches) up to 3 times.
-async function rpcMany<T>(calls: Call[]): Promise<T[]> {
+// Batched calls; failed ones are retried (as smaller batches) until `attempts` tries.
+export async function rpcMany<T>(calls: Call[], attempts = ATTEMPTS): Promise<T[]> {
   const out = new Array<T>(calls.length);
   let pending = calls.map((_, i) => i);
   for (let attempt = 1; pending.length; attempt++) {
@@ -75,33 +79,38 @@ async function rpcMany<T>(calls: Call[]): Promise<T[]> {
         lastError = String(e instanceof Error ? e.message : e);
       }
     }));
-    if (failed.length && attempt === ATTEMPTS) throw new Error(`${calls[failed[0]].method}: ${redact(lastError)}`);
+    if (failed.length && attempt >= attempts) throw new Error(`${calls[failed[0]].method}: ${redact(lastError)}`);
     retried += failed.length;
     if (failed.length) await Bun.sleep(2000 * attempt);
     pending = failed;
   }
   return out;
 }
-const rpc = async <T>(method: string, params: unknown[]) => (await rpcMany<T>([{ method, params }]))[0];
+export const rpc = async <T>(method: string, params: unknown[]) => (await rpcMany<T>([{ method, params }]))[0];
 
-type Signature = { signature: string; slot: number; err: unknown };
+export type Signature = { signature: string; slot: number; blockTime: number | null; err: unknown };
 
-// Solami's signature index times out past ~30 days; mainnet-beta has them all but allows ~1 call/s.
+// Solami's signature index times out past ~30 days (and on wallets whose only transactions are minutes
+// old). Public archive RPCs have them all but allow about one call a second per client each
+// (PUBLIC_RPC_SPACING_MS between calls to one endpoint); calls go to whichever endpoint is free first.
 const SOLAMI_SIGNATURE_DAYS = 25;
-const PUBLIC_RPC = "https://api.mainnet-beta.solana.com";
-let publicSlot = 0;
-async function publicSignatures(params: unknown[]) {
+const PUBLIC_RPCS = ["https://api.mainnet-beta.solana.com", "https://public.rpc.solanavibestation.com"].map((url) => ({ url, next: 0 }));
+const PUBLIC_SPACING_MS = Number(process.env.PUBLIC_RPC_SPACING_MS ?? 1100);
+export async function publicSignatures(params: unknown[]) {
   for (let attempt = 1; ; attempt++) {
-    const at = Math.max(Date.now(), publicSlot);
-    publicSlot = at + 1100;
+    const rpc = PUBLIC_RPCS.reduce((a, b) => (b.next < a.next ? b : a));
+    const at = Math.max(Date.now(), rpc.next);
+    rpc.next = at + PUBLIC_SPACING_MS;
     await Bun.sleep(at - Date.now());
-    const res = await fetch(PUBLIC_RPC, {
+    const res = await fetch(rpc.url, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getSignaturesForAddress", params }),
     }).catch(() => null);
-    const body = res?.ok ? ((await res.json()) as { result?: Signature[] }) : null;
+    const body = res?.ok ? ((await res.json().catch(() => null)) as { result?: Signature[]; error?: { message: string } } | null) : null;
     if (body?.result) return body.result;
-    if (attempt === ATTEMPTS) throw new Error(`getSignaturesForAddress (mainnet-beta): HTTP ${res?.status}`);
+    if (attempt === ATTEMPTS * 2) throw new Error(`getSignaturesForAddress (public RPC): ${body?.error?.message ?? `HTTP ${res?.status}`}`);
+    // Rate limited (429, or an error body): every caller in this process backs off from that endpoint.
+    if (res?.status === 429 || body?.error) rpc.next += 2000;
   }
 }
 
@@ -112,10 +121,16 @@ async function signatures(address: string, createdAt: number) {
   let solami = createdAt > Date.now() / 1000 - SOLAMI_SIGNATURE_DAYS * 86400;
   while (true) {
     const params = [address, { limit: 1000, before }];
+    // One Solami attempt (a failure there is a ~40 s timeout, retrying rarely helps), then mainnet-beta.
     const page = solami
-      ? await rpc<Signature[]>("getSignaturesForAddress", params).catch(() => ((solami = false), null))
+      ? await rpcMany<Signature[]>([{ method: "getSignaturesForAddress", params }], 1).then((r) => r[0], () => ((solami = false), null))
       : await publicSignatures(params);
     if (!page) continue;
+    // Solami answers some older addresses with an empty list; every pool has at least its creation.
+    if (solami && !page.length && !out.length) {
+      solami = false;
+      continue;
+    }
     out.push(...page);
     if (page.length < 1000) return out.filter((s) => !s.err).reverse();
     if (out.length >= MAX_TXS) return null;
@@ -178,39 +193,70 @@ export async function replayPool(pool: string, scope: "full" | "creation") {
   return "done";
 }
 
-// Contested candidates first: graduated, judged unverified (no rule fired, no transaction evidence).
+// Candidate pools and the scope each is replayed with. Contested candidates first: graduated, judged
+// unverified (no rule fired, no transaction evidence). An attempt that failed (RPC errors) is retried after an hour.
+const SETTLED = "(r.status NOT LIKE 'error%' OR r.at > unixepoch() - 3600)";
 const CANDIDATES = {
-  full: `SELECT p.address FROM pools p WHERE p.graduated_at IS NOT NULL AND p.verdict IS NULL AND p.created_at >= ?
-    AND NOT EXISTS (SELECT 1 FROM replays r WHERE r.pool = p.address) ORDER BY p.graduated_at DESC LIMIT ?`,
+  full: `SELECT p.address, 'full' FROM pools p WHERE p.graduated_at IS NOT NULL AND p.verdict IS NULL AND p.created_at >= $since
+    AND NOT EXISTS (SELECT 1 FROM replays r WHERE r.pool = p.address AND ${SETTLED}) ORDER BY p.graduated_at DESC LIMIT $limit`,
   // Unverified graduations are left to the full replay (a superset), so the two can run side by side.
-  creation: `SELECT p.address FROM pools p WHERE p.graduated_at >= ? AND p.created_at >= ? AND p.verdict IS NOT NULL
+  creation: `SELECT p.address, 'creation' FROM pools p WHERE p.graduated_at >= $since AND p.created_at >= $since AND p.verdict IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM pool_evidence e WHERE e.pool = p.address AND e.complete = 1)
-    AND NOT EXISTS (SELECT 1 FROM replays r WHERE r.pool = p.address) ORDER BY p.graduated_at DESC LIMIT ?`,
+    AND NOT EXISTS (SELECT 1 FROM replays r WHERE r.pool = p.address AND ${SETTLED}) ORDER BY p.graduated_at DESC LIMIT $limit`,
+  hot: `SELECT p.address, 'full' FROM pools p INDEXED BY pools_last_trade WHERE p.last_trade_at >= unixepoch() - 600 AND p.graduated_at IS NULL
+    AND p.migration_threshold > 0 AND p.created_at >= $since
+    AND NOT EXISTS (SELECT 1 FROM pool_evidence e WHERE e.pool = p.address AND e.complete = 1)
+    AND NOT EXISTS (SELECT 1 FROM replays r WHERE r.pool = p.address AND ${SETTLED})
+    ORDER BY CAST(p.quote_reserve AS REAL) / p.migration_threshold DESC LIMIT $limit`,
+  redo: `SELECT e.pool, CASE WHEN e.partial THEN 'creation' ELSE 'full' END FROM pool_evidence e JOIN pools p ON p.address = e.pool
+    WHERE e.source = 'rpc' AND e.version IS NOT ${EVIDENCE_VERSION} AND p.created_at >= $since
+    ORDER BY e.partial, p.graduated_at DESC LIMIT $limit`,
 };
+export type ReplayMode = keyof typeof CANDIDATES;
 
-export async function replay(scope: "full" | "creation", days: number, limit: number) {
+export async function replay(mode: ReplayMode, days: number, limit: number) {
   const since = Math.floor(Date.now() / 1000) - days * 86400;
-  const pools = (scope === "full" ? db.query(CANDIDATES.full).values(since, limit) : db.query(CANDIDATES.creation).values(since, since, limit)).flat() as string[];
+  const pools = db.query(CANDIDATES[mode]).values({ $since: since, $limit: limit }) as [string, "full" | "creation"][];
   const tally: Record<string, number> = {};
   const started = performance.now();
   let next = 0;
   const worker = async () => {
     while (next < pools.length) {
-      const pool = pools[next++];
+      const [pool, scope] = pools[next++];
       const result = await replayPool(pool, scope).catch((e) => {
         saveReplay.run(pool, scope, `error: ${String(e.message).slice(0, 80)}`, 0, Math.floor(Date.now() / 1000));
         return "error";
       });
       tally[result] = (tally[result] ?? 0) + 1;
       const n = Object.values(tally).reduce((a, b) => a + b, 0);
-      if (n % 20 === 0) console.log(`${scope} ${n}/${pools.length}`, tally, `${retried} calls retried`, `${((performance.now() - started) / 1000).toFixed(0)}s`);
+      if (n % 20 === 0 && mode !== "hot") console.log(`${mode} ${n}/${pools.length}`, tally, `${retried} calls retried`, `${((performance.now() - started) / 1000).toFixed(0)}s`);
     }
   };
-  await Promise.all(Array.from({ length: POOLS_AT_ONCE }, worker));
+  await Promise.all(Array.from({ length: Math.min(POOLS_AT_ONCE, pools.length) }, worker));
   return { pools: pools.length, ...tally };
 }
 
+// Every config created in a transaction an operator key (integrity.ts OPERATOR_KEYS) signed: the key
+// becomes the config's signer, then launchpads are reassigned.
+const attributeConfig = db.prepare(`INSERT INTO configs (address, signer) VALUES (?, ?) ON CONFLICT(address) DO UPDATE SET signer = excluded.signer`);
+export async function attributeOperators() {
+  const configs: Record<string, number> = {};
+  for (const key of OPERATOR_KEYS) {
+    const sigs = ((await signatures(key, 0)) ?? []).map((s) => s.signature);
+    const txs = await transactions(sigs);
+    const found = new Set<string>();
+    txs.forEach((tx, i) => {
+      if (tx && !tx.meta?.err) for (const step of decodeDbcTx(toDbcTx(sigs[i], tx))) if (step.kind === "config") found.add(step.config);
+    });
+    db.transaction(() => found.forEach((config) => attributeConfig.run(config, key))).immediate();
+    configs[key] = found.size;
+  }
+  assignLaunchpads();
+  return configs;
+}
+
 if (import.meta.main) {
-  const [scope = "full", days = "58", limit = "1000000"] = process.argv.slice(2);
-  console.log("replay", scope, await replay(scope as "full" | "creation", Number(days), Number(limit)));
+  const [mode = "full", days = "58", limit = "1000000"] = process.argv.slice(2);
+  if (mode === "operators") console.log("configs co-signed by operator keys", await attributeOperators());
+  else console.log("replay", mode, await replay(mode as ReplayMode, Number(days), Number(limit)));
 }

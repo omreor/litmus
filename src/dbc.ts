@@ -110,6 +110,12 @@ export type DbcStep =
 
 const QUOTE_TO_BASE = 1;
 const b58 = (v: { toBase58(): string }) => v.toBase58();
+// The program emits a legacy event next to its v2 counterpart for the same action (every swap: EvtSwap +
+// EvtSwap2; config creation: EvtCreateConfig + EvtCreateConfigV2). Only the v2 event counts.
+const SUPERSEDED_BY: Record<string, string[]> = {
+  EvtSwap: ["EvtSwap2", "EvtSwap2WithTransferHook"],
+  EvtCreateConfig: ["EvtCreateConfigV2", "EvtCreateConfigV2WithTransferHook"],
+};
 
 // Events carry no trader: it's the payer of the swap instruction that emitted them, paired per pool in order.
 export function decodeDbcTx(tx: DbcTx): DbcStep[] {
@@ -132,7 +138,8 @@ export function decodeDbcTx(tx: DbcTx): DbcStep[] {
       inits.push({ meta: (decoded.data as any).params, signer: key(initPayer.get(decoded.name)) ?? key(INIT_CREATOR) });
     }
   }
-  return events.flatMap(({ name, data: e }): DbcStep[] => {
+  const names = new Set(events.map((e) => e.name));
+  return events.filter((e) => !SUPERSEDED_BY[e.name]?.some((v2) => names.has(v2))).flatMap(({ name, data: e }): DbcStep[] => {
     switch (name) {
       case "EvtInitializePool":
       case "EvtInitializePoolWithTransferHook": {

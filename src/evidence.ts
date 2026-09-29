@@ -9,16 +9,23 @@ export type Evidence = {
   pool: string; complete: number; creation_slot: number | null; creation_sig: string | null; creators: string;
   creator_fill: number; creator_fill_sig: string | null; slot_fill: number; buy_volume: number; sell_volume: number;
   creator_volume: number; buyers: number; trades: number; completion_slot: number | null; completion_sig: string | null; source: string;
-  partial: number;
+  partial: number; version: number | null;
 };
+
+// Bump when applyEvidence or the decoder changes what a transaction contributes. Rows keep the version they
+// were built with (applying new transactions to an older row doesn't upgrade it); older rows are rebuilt
+// from the archive (archive.ts rebuildEvidence) or replayed again (replay.ts redo). Version 2: every swap
+// counted once (it was counted twice from its EvtSwap + EvtSwap2 events), per-buyer volume and first buy.
+export const EVIDENCE_VERSION = 2;
 
 const COLUMNS = [
   "pool", "complete", "creation_slot", "creation_sig", "creators", "creator_fill", "creator_fill_sig", "slot_fill", "buy_volume",
-  "sell_volume", "creator_volume", "buyers", "trades", "completion_slot", "completion_sig", "source", "partial",
+  "sell_volume", "creator_volume", "buyers", "trades", "completion_slot", "completion_sig", "source", "partial", "version",
 ] as const;
 const getEvidence = db.prepare("SELECT * FROM pool_evidence WHERE pool = ?");
 const saveEvidence = db.prepare(`INSERT OR REPLACE INTO pool_evidence (${COLUMNS.join()}) VALUES (${COLUMNS.map((c) => `$${c}`).join()})`);
-const addBuyer = db.prepare("INSERT OR IGNORE INTO pool_buyers (pool, wallet) VALUES (?, ?)");
+const addBuyer = db.prepare("INSERT OR IGNORE INTO pool_buyers (pool, wallet, volume, slot, sig) VALUES (?, ?, ?, ?, ?)");
+const addBuyerVolume = db.prepare("UPDATE pool_buyers SET volume = volume + ? WHERE pool = ? AND wallet = ?");
 const poolCreator = db.prepare("SELECT creator FROM pools WHERE address = ?");
 
 export const evidenceOf = (pool: string) => getEvidence.get(pool) as Evidence | null;
@@ -28,7 +35,7 @@ function fresh(pool: string, source: string): Evidence {
   return {
     pool, complete: 0, creation_slot: null, creation_sig: null, creators: JSON.stringify(creator ? [creator] : []), creator_fill: 0,
     creator_fill_sig: null, slot_fill: 0, buy_volume: 0, sell_volume: 0, creator_volume: 0, buyers: 0, trades: 0,
-    completion_slot: null, completion_sig: null, source, partial: 0,
+    completion_slot: null, completion_sig: null, source, partial: 0, version: EVIDENCE_VERSION,
   };
 }
 
@@ -51,7 +58,8 @@ export function applyEvidence(tx: DbcTx, step: DbcStep, source: string, partial 
     if (byCreator) e.creator_volume += quote;
     if (step.buy) {
       e.buy_volume += quote;
-      if (addBuyer.run(step.pool, step.trader).changes) e.buyers++;
+      if (addBuyer.run(step.pool, step.trader, quote, tx.slot, tx.sig).changes) e.buyers++;
+      else addBuyerVolume.run(quote, step.pool, step.trader);
     } else e.sell_volume += quote;
     if (e.creation_slot !== null && tx.slot === e.creation_slot) {
       e.slot_fill = step.reserve !== null ? Number(step.reserve) : e.slot_fill + Number(step.net);

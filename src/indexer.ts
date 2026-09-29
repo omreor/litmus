@@ -1,7 +1,7 @@
 import { decodeDbcTx, type DbcTx } from "./dbc";
 import { queueConfig } from "./enrich";
 import { applyEvidence, firstSighting } from "./evidence";
-import { judgementOf, judgePool, launchpadLabel, verdictFields, type Signals } from "./integrity";
+import { judgementOf, judgePool, launchpadLabel, OPERATOR_KEYS, verdictFields, type Signals } from "./integrity";
 import { cleanText } from "./metadata";
 import { db, recordGraduation, recordLaunch, recordSwap } from "./store";
 
@@ -41,14 +41,21 @@ export function flushVerdicts() {
   db.transaction(() => pools.forEach((pool) => judgePool(pool))).immediate();
 }
 
+// A config created in a transaction an operator key co-signed belongs to that launchpad (integrity.ts
+// OPERATOR_KEYS); describing the config later keeps the attribution.
+const attributeConfig = db.prepare(`INSERT INTO configs (address, signer, launchpad) VALUES (?, ?, ?)
+  ON CONFLICT(address) DO UPDATE SET signer = excluded.signer, launchpad = excluded.launchpad`);
+
 // Source-agnostic: the live stream, the archive replay and the RPC sampler all deliver DbcTx. Each
 // transaction is applied once (store counters, evidence); feed items go out only for live ones, after
 // the whole transaction is applied so a launch's verdict sees the creator's buy in the same transaction.
 export function handleTransaction(tx: DbcTx, source: "live" | "archive") {
   if (!firstSighting(tx.sig, tx.slot)) return;
   const steps = decodeDbcTx(tx);
+  const operator = tx.accountKeys.find((k) => OPERATOR_KEYS.includes(k));
   db.transaction(() => {
     for (const step of steps) {
+      if (step.kind === "config" && operator) attributeConfig.run(step.config, operator, operator);
       queueConfig(step.config);
       if (step.kind === "launch") {
         const meta = step.meta && { name: cleanText(step.meta.name), symbol: cleanText(step.meta.symbol), uri: step.meta.uri };
@@ -61,14 +68,20 @@ export function handleTransaction(tx: DbcTx, source: "live" | "archive") {
       applyEvidence(tx, step, source);
     }
   }).immediate();
+  // One feed item per (type, pool or config) and transaction.
+  const emitted = new Set<string>();
   for (const step of steps) {
     if (step.kind === "swap") continue;
+    const key = `${step.kind}:${step.kind === "config" ? step.config : step.pool}`;
+    if (emitted.has(key)) continue;
+    emitted.add(key);
     let item: FeedItem | null;
     if (step.kind === "config") {
       if (source !== "live") continue;
+      const id = operator ?? step.feeClaimer;
       item = {
         type: "config", ts: tx.blockTime, sig: tx.sig, config: step.config, feeClaimer: step.feeClaimer, quoteMint: step.quoteMint,
-        launchpad: { id: step.feeClaimer, name: launchpadLabel(step.feeClaimer).name },
+        launchpad: { id, name: launchpadLabel(id).name },
         verdict: "unverified", contested: null, organic: true, evidence: {}, signals: null, receipts: [], reasons: [],
       };
     } else if (step.kind === "launch") {

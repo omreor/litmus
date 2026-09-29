@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 process.env.DB_PATH = ":memory:";
 const { judge } = await import("./integrity");
+const { decodeDbcTx } = await import("./dbc");
 type Facts = Parameters<typeof judge>[0];
 type Ev = NonNullable<Parameters<typeof judge>[1]>;
 
@@ -12,7 +13,7 @@ const facts = (f: Partial<Facts> = {}): Facts => ({
 const ev = (e: Partial<Ev> = {}): Ev => ({
   pool: "p", complete: 1, partial: 0, creation_slot: 10, creation_sig: "create", creators: "[]", creator_fill: 0, creator_fill_sig: null,
   slot_fill: 0, buy_volume: 100e9, sell_volume: 20e9, creator_volume: 1e9, buyers: 40, trades: 90, completion_slot: 500, completion_sig: "done",
-  source: "live", ...e,
+  source: "live", version: 2, ...e,
 });
 const prior = { rules: ["template-prior"], reasons: ["auto-completing: 100% of 5,000 pools graduated"] };
 
@@ -44,4 +45,25 @@ test("creation-slot-only evidence judges fills but not buyers", () => {
 
 test("few buyers only counts once the curve completed", () => {
   expect(judge(facts({ graduatedAt: null }), ev({ buyers: 2, completion_slot: null })).verdict).toBe("unverified");
+});
+
+test("a buyer swarm funded by one wallet is uncontested, with the funding transactions as receipts", () => {
+  const funding = { sampled: 12, traced: 12, funder: "F", hops: 1, buyers: 9, share: 0.7, pool_share: 0.4, creator: 0, cosigned: 1, receipts: '["fund1","fund2"]' };
+  const j = judge(facts({ funding }), ev());
+  expect(j.rules).toEqual(["funded-swarm"]);
+  expect(j.receipts).toContain("fund1");
+  expect(judge(facts({ funding: { ...funding, share: 0.3 } }), ev()).verdict).toBe("contested");
+  expect(judge(facts({ funding: { ...funding, funder: null, buyers: 0, share: 0 } }), ev()).evidence["funding source"]).toContain("no common funder");
+});
+
+// Mainnet swap (2026-09-29): one swap2 instruction emits both EvtSwap and EvtSwap2.
+const SWAP_TX = {"sig":"2ypU8Fam4xbu1Tb4iC2MeS2VwL7HB34RVABRLeqz6wMYaV6FWhiA3XQfvsUEtsvGABuF856x89RhzdgixJ6YV2Mq","slot":451622025,"seen":1790679600,"keys":["5jdx3oir1YfT6w1h2oG3k8ympDgcQ7pFH1pifgVa389P","CfdX89WFJpf1hVPFJJ4RYYiEFRAKQ5QDTJiVsQTbjWnZ","G474CkX4pK1odFwtfVMteA657HvJKHUTK4Svi5NNNa6F","BfV6fjCxRoyBzMnexET9YghWZdV463cMStEb9RELS7VX","HNH29mZXKufkg7et9eMr6ZtRs4EZoxqrk7WiDfNGF1Rh","A5mQYBNd5uqTXzf7nsoztVLJ5zwnUdprV4GTwhc1y4uB","ComputeBudget111111111111111111111111111111","ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL","So11111111111111111111111111111111111111112","11111111111111111111111111111111","TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","AgXqSDdngnHVRD8E5nNvtpdyETnZB2hTaMvS8mDwD4kg","TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb","dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN","FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM","EZmnjPixJw8JHS71LrztKXfqbCzA5HnQFbYSraZzNYpk","8Ks12pbrD6PXxfty1hVQiE9sc289zgU1zHkvXhrSdriF"],"ixs":[{"inner":false,"accounts":[14,15,3,1,2,4,5,11,8,0,12,10,13,16,13],"data":"QUs/TOtbW4jtuBkHAAAAAFQ/RXg6AAAAAA=="},{"inner":true,"accounts":[16],"data":"5EWlLlHLmh0bPBXViqq7k55wtc+5QnuYSh77wH2zgfTygZ+k7lwoiDPlBDTH7IaGyY0ojZPgGoqSQnVqUhZrCWFpYlzVbvYwrMVARsEx+8UBAO24GQcAAAAAVD9FeDoAAADtuBkHAAAAAA0lK/E6AAAAa4K/OTCXkQUAAAAAAAAAAFAEQR4AAAAAE0GQBwAAAAAAAAAAAAAAAO24GQcAAAAAL5q7agAAAAA="},{"inner":true,"accounts":[16],"data":"5EWlLlHLmh29QjOoJlB1mZ5wtc+5QnuYSh77wH2zgfTygZ+k7lwoiDPlBDTH7IaGyY0ojZPgGoqSQnVqUhZrCWFpYlzVbvYwrMVARsEx+8UBAO24GQcAAAAAVD9FeDoAAAAA7bgZBwAAAADtuBkHAAAAAAAAAAAAAAAADSUr8ToAAABrgr85MJeRBQAAAAAAAAAAUARBHgAAAAATQZAHAAAAAAAAAAAAAAAAxC6zdQIAAAAAgXWOAgAAAC+au2oAAAAA"}]};
+
+test("a swap that emits EvtSwap and EvtSwap2 counts once, for the wallet that paid", () => {
+  const steps = decodeDbcTx({
+    sig: SWAP_TX.sig, slot: SWAP_TX.slot, blockTime: SWAP_TX.seen, accountKeys: SWAP_TX.keys,
+    ixs: SWAP_TX.ixs.map((ix) => ({ accounts: ix.accounts, data: Buffer.from(ix.data, "base64") })),
+  });
+  expect(steps.length).toBe(1);
+  expect(steps[0]).toMatchObject({ kind: "swap", buy: true, trader: "5jdx3oir1YfT6w1h2oG3k8ympDgcQ7pFH1pifgVa389P", reserve: 10564611780n });
 });

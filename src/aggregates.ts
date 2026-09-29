@@ -1,11 +1,12 @@
 import { judgementOf, launchpadLabel, medians, verdictFields } from "./integrity";
-import { postGraduationBy, postGraduationOf } from "./postgrad";
+import { outcomesByVerdict, postGraduationBy, postGraduationOf } from "./postgrad";
 import { db } from "./store";
 
 // Full-history aggregates behind the leaderboards, templates, integrity history and priors. They scan
 // up to all 1.7M pools, so a Worker (bottom of this file) recomputes them on a timer and posts the
 // results to the server, which serves them from memory; the same functions answer uncommon
-// parameters directly. `organic` in the API = not judged uncontested (contested or unverified).
+// parameters directly. `organic` in the API = not judged uncontested (contested or unverified); organic* and
+// factory* fields are deprecated aliases kept next to their contested/uncontested counterparts.
 
 export const WINDOWS = [3600, 6 * 3600, 86400, 7 * 86400, 30 * 86400];
 const DBC_LAUNCH_TIME = 1745388780;
@@ -37,31 +38,44 @@ export function monthly() {
     FROM pools p JOIN configs c ON c.address = p.config WHERE p.created_at >= ? AND c.quote_mint = ? GROUP BY month`).all(DBC_LAUNCH_TIME, SOL) as any[])
     .map(({ month, ...v }) => [month, { feeImpliedVolumeSol: Math.round(v.feeImpliedVolumeSol), volumeFarmVolumeSol: Math.round(v.volumeFarmVolumeSol) }]));
   const empty = { graduations: 0, factoryGraduations: 0, contestedGraduations: 0, unverifiedGraduations: 0 };
-  return created.map((r) => ({ ...r, ...(graduated.get(r.month) ?? empty), ...volume.get(r.month), month: r.month }));
+  // factory* are the deprecated names of uncontested*.
+  return created.map((r) => {
+    const g = graduated.get(r.month) ?? empty;
+    return { ...r, ...g, uncontestedPools: r.factoryPools, uncontestedGraduations: g.factoryGraduations, ...volume.get(r.month), month: r.month };
+  });
 }
 
 type Pad = { id: string; name: string | null; website: string | null; logo: string | null };
 const padOf = (id: string): Pad => ({ id, ...launchpadLabel(id) });
 
+// Median time to graduate: contested graduations only (contract v2.1).
+const contestedTtg = (column: string, where = "") => medians(`SELECT c.${column} key, p.graduated_at - p.created_at value
+  FROM pools p JOIN configs c ON c.address = p.config WHERE p.graduated_at IS NOT NULL AND p.verdict = 1 ${where} ORDER BY key, value`);
+
 export function launchpadsAllTime() {
-  const ttg = medians(`SELECT c.launchpad key, p.graduated_at - p.created_at value FROM pools p JOIN configs c ON c.address = p.config
-    WHERE p.graduated_at IS NOT NULL AND p.verdict IS NOT 0 ORDER BY key, value`);
+  const ttg = contestedTtg("launchpad");
   const post = postGraduationBy("launchpad");
-  const rows = db.query(`SELECT c.launchpad id, COUNT(*) pools, COUNT(p.graduated_at) graduations, COALESCE(SUM(p.verdict IS NOT 0), 0) organicPools,
-      COALESCE(SUM(p.graduated_at IS NOT NULL AND p.verdict IS NOT 0), 0) organicGraduations, COALESCE(SUM(p.graduated_at IS NOT NULL AND p.verdict = 1), 0) contestedGraduations,
-      COALESCE(SUM(p.verdict = 0), 0) uncontestedPools
+  const rows = db.query(`SELECT c.launchpad id, COUNT(*) pools, COUNT(p.graduated_at) graduations,
+      COALESCE(SUM(p.verdict = 1), 0) contestedPools, COALESCE(SUM(p.graduated_at IS NOT NULL AND p.verdict = 1), 0) contestedGraduations,
+      COALESCE(SUM(p.verdict = 0), 0) uncontestedPools, COALESCE(SUM(p.graduated_at IS NOT NULL AND p.verdict = 0), 0) uncontestedGraduations,
+      COALESCE(SUM(p.verdict IS NOT 0), 0) organicPools, COALESCE(SUM(p.graduated_at IS NOT NULL AND p.verdict IS NOT 0), 0) organicGraduations
     FROM pools p JOIN configs c ON c.address = p.config GROUP BY c.launchpad HAVING pools >= ${MIN_SAMPLE}`).all() as any[];
-  return Object.fromEntries(rows.map(({ id, uncontestedPools, ...r }: any) => [id as string, {
-    factoryShare: uncontestedPools / r.pools, allTime: { ...r, medianSecondsToGraduate: ttg.get(id) ?? null }, postGraduation: post.get(id) ?? null,
+  return Object.fromEntries(rows.map(({ id, ...r }: any) => [id as string, {
+    uncontestedShare: r.uncontestedPools / r.pools, factoryShare: r.uncontestedPools / r.pools,
+    allTime: { ...r, medianSecondsToGraduate: ttg.get(id) ?? null }, postGraduation: post.get(id) ?? null,
   }]));
 }
 
 export function launchpads(since: number, allTime: ReturnType<typeof launchpadsAllTime>) {
-  const window = db.query(`SELECT c.launchpad id, COALESCE(SUM(p.created_at >= $since), 0) launches, COALESCE(SUM(p.created_at >= $since AND p.verdict IS NOT 0), 0) organicLaunches,
-      COALESCE(SUM(p.graduated_at >= $since), 0) graduations, COALESCE(SUM(p.graduated_at >= $since AND p.verdict IS NOT 0), 0) organicGraduations
+  const window = db.query(`SELECT c.launchpad id, COALESCE(SUM(p.created_at >= $since), 0) launches, COALESCE(SUM(p.graduated_at >= $since), 0) graduations,
+      COALESCE(SUM(p.created_at >= $since AND p.verdict = 1), 0) contestedLaunches, COALESCE(SUM(p.graduated_at >= $since AND p.verdict = 1), 0) contestedGraduations,
+      COALESCE(SUM(p.created_at >= $since AND p.verdict = 0), 0) uncontestedLaunches, COALESCE(SUM(p.graduated_at >= $since AND p.verdict = 0), 0) uncontestedGraduations,
+      COALESCE(SUM(p.created_at >= $since AND p.verdict IS NOT 0), 0) organicLaunches, COALESCE(SUM(p.graduated_at >= $since AND p.verdict IS NOT 0), 0) organicGraduations
     FROM pools p JOIN configs c ON c.address = p.config WHERE p.created_at >= $since OR p.graduated_at >= $since GROUP BY c.launchpad`).all({ $since: since }) as any[];
   const inWindow = new Map(window.map(({ id, ...w }) => [id, w]));
-  const zero = { launches: 0, organicLaunches: 0, graduations: 0, organicGraduations: 0 };
+  const zero = {
+    launches: 0, graduations: 0, contestedLaunches: 0, contestedGraduations: 0, uncontestedLaunches: 0, uncontestedGraduations: 0, organicLaunches: 0, organicGraduations: 0,
+  };
   const rows = Object.entries(allTime).map(([id, a]) => ({ ...padOf(id), ...a, window: inWindow.get(id) ?? zero }));
   const ranked = rows.toSorted((a, b) => b.window.organicGraduations - a.window.organicGraduations || b.allTime.organicGraduations - a.allTime.organicGraduations);
   const top = ranked.slice(0, LIST_LIMIT);
@@ -99,9 +113,10 @@ function templateHead(template: string, configs: { address: string; n: number }[
   const pad = pads[0] && pads[0].n / total > 0.5 ? padOf(pads[0].id) : null;
   const q = quote(described.quote_mint);
   const prior = templatePrior.get(template) as { factory: number; reasons: string } | null;
+  const reasons = prior ? (JSON.parse(prior.reasons) as string[]) : [];
   return {
     template, label: templateLabel(pad, q, described.threshold, info), shape: info.shape, launchpad: pad ? { id: pad.id, name: pad.name } : null,
-    quote: q, threshold: described.threshold, factory: !!prior?.factory, factoryReasons: prior ? (JSON.parse(prior.reasons) as string[]) : [],
+    quote: q, threshold: described.threshold, uncontested: !!prior?.factory, uncontestedReasons: reasons, factory: !!prior?.factory, factoryReasons: reasons,
     config: described.address,
   };
 }
@@ -116,11 +131,12 @@ function groupRows<T extends { template: string }>(rows: T[]) {
 }
 
 export function templates(since: number, organicOnly: boolean, describe = new Set<string>()) {
-  const rows = db.query(`SELECT c.template, COUNT(*) pools, COUNT(p.graduated_at) graduated, COALESCE(SUM(p.verdict IS NOT 0), 0) organicPools,
-      COALESCE(SUM(p.graduated_at IS NOT NULL AND p.verdict IS NOT 0), 0) organicGraduated
+  const rows = db.query(`SELECT c.template, COUNT(*) pools, COUNT(p.graduated_at) graduated,
+      COALESCE(SUM(p.verdict = 1), 0) contestedPools, COALESCE(SUM(p.graduated_at IS NOT NULL AND p.verdict = 1), 0) contestedGraduated,
+      COALESCE(SUM(p.verdict = 0), 0) uncontestedPools, COALESCE(SUM(p.graduated_at IS NOT NULL AND p.verdict = 0), 0) uncontestedGraduated,
+      COALESCE(SUM(p.verdict IS NOT 0), 0) organicPools, COALESCE(SUM(p.graduated_at IS NOT NULL AND p.verdict IS NOT 0), 0) organicGraduated
     FROM pools p JOIN configs c ON c.address = p.config WHERE p.created_at >= ? GROUP BY c.template`).all(since) as any[];
-  const ttg = medians(`SELECT c.template key, p.graduated_at - p.created_at value FROM pools p JOIN configs c ON c.address = p.config
-    WHERE p.created_at >= ${since} AND p.graduated_at IS NOT NULL AND p.verdict IS NOT 0 ORDER BY key, value`);
+  const ttg = contestedTtg("template", `AND p.created_at >= ${since}`);
   const configs = groupRows(db.query(`SELECT c.template, c.address, COUNT(*) n FROM pools p JOIN configs c ON c.address = p.config
     WHERE p.created_at >= ? GROUP BY c.address ORDER BY n DESC`).all(since) as { template: string; address: string; n: number }[]);
   const pads = groupRows(db.query(`SELECT c.template, c.launchpad id, COUNT(*) n FROM pools p JOIN configs c ON c.address = p.config
@@ -219,7 +235,8 @@ export function templateDetail(id: string, oddsByTemplate: Record<string, unknow
     return { ...p, ...(j && verdictFields(j)), postGraduation: p.graduated_at ? postGraduationOf(p.address) : null };
   });
   return {
-    template: id, label: head.label, shape: head.shape, factory: head.factory, factoryReasons: head.factoryReasons,
+    template: id, label: head.label, shape: head.shape, uncontested: head.uncontested, uncontestedReasons: head.uncontestedReasons,
+    factory: head.factory, factoryReasons: head.factoryReasons,
     configs: top.map((c) => ({ address: c.address, pools: c.pools, graduated: c.graduated, info: JSON.parse(c.info) })),
     odds: oddsByTemplate[id] ?? PROGRESS_STEPS.map((step) => ({ step, reached: 0, graduated: 0 })), recent,
   };
@@ -237,6 +254,7 @@ if (!Bun.isMainThread) {
     try {
       if (round % 10 === 0) {
         post("monthly", monthly());
+        post("postgrad", outcomesByVerdict());
         allTime = launchpadsAllTime();
         oddsByTemplate = odds();
         post("odds", oddsByTemplate);

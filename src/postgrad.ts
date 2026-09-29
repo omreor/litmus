@@ -71,19 +71,23 @@ async function snapshot(targets: Target[], day: number) {
 const TARGETS = `SELECT p.address, p.base_mint, c.quote_mint, c.migration_fee_option, COALESCE(m.decimals, 9) decimals, p.graduated_at
   FROM pools p JOIN configs c ON c.address = p.config LEFT JOIN mints m ON m.mint = c.quote_mint
   WHERE c.migration_option = ${DAMM_V2} AND p.base_mint IS NOT NULL`;
-const due = db.prepare(`${TARGETS} AND p.graduated_at BETWEEN ? AND ?
-  AND NOT EXISTS (SELECT 1 FROM post_graduation g WHERE g.pool = p.address AND g.day = ?) LIMIT 2000`);
+// Days 1 and 7 need the day-0 baseline (in SQL, so pools without one never crowd the limit out).
+const due = db.prepare(`${TARGETS} AND p.graduated_at BETWEEN $from AND $to
+  AND NOT EXISTS (SELECT 1 FROM post_graduation g WHERE g.pool = p.address AND g.day = $day)
+  AND ($day = 0 OR EXISTS (SELECT 1 FROM post_graduation b WHERE b.pool = p.address AND b.day = 0)) LIMIT 2000`);
 
-// Day 0 once migrated (a few minutes after graduation), days 1 and 7 on schedule. Graduations from
-// before this ran get no snapshots: history only has current state (day -1).
+// Day 0 once migrated (a few minutes after graduation), days 1 and 7 on schedule. A day-0 read taken
+// later than BASELINE_SECONDS after graduation would make the +1d volume cover only part of the day, so
+// graduations missed that long (server down) get no snapshots, like graduations from before this ran:
+// history only has current state (day -1).
+const BASELINE_SECONDS = 3 * 3600;
 export async function snapshotGraduations() {
   const now = Math.floor(Date.now() / 1000);
-  const plan: [number, number, number][] = [[0, now - DAY, now - 300], [1, now - 2 * DAY, now - DAY], [7, now - 8 * DAY, now - 7 * DAY]];
+  const plan: [number, number, number][] = [[0, now - BASELINE_SECONDS, now - 300], [1, now - 2 * DAY, now - DAY], [7, now - 8 * DAY, now - 7 * DAY]];
   const counts: Record<number, number> = {};
   for (const [day, from, to] of plan) {
-    const targets = due.all(from, to, day) as Target[];
-    const eligible = day === 0 ? targets : targets.filter((t) => baseline.get(t.address));
-    counts[day] = eligible.length ? await snapshot(eligible, day) : 0;
+    const targets = due.all({ $from: from, $to: to, $day: day }) as Target[];
+    counts[day] = targets.length ? await snapshot(targets, day) : 0;
   }
   return counts;
 }
@@ -132,6 +136,21 @@ export function postGraduationBy(column: "template" | "launchpad") {
       LEFT JOIN post_graduation d1 ON d1.pool = cur.pool AND d1.day = 1 LEFT JOIN post_graduation d7 ON d7.pool = cur.pool AND d7.day = 7
     WHERE cur.day = -1 AND p.graduated_at <= $settled AND (prev.pool IS NOT NULL OR d7.pool IS NOT NULL) GROUP BY key`).all({ $alive: ALIVE_LIQUIDITY_USD, $settled: Math.floor(Date.now() / 1000) - 7 * DAY }) as any[];
   return new Map(rows.map(({ key, ...r }) => [key as string, r as { graduated: number; aliveD1: number; aliveD7: number; lpPulled: number }]));
+}
+
+// Outcomes by verdict for graduations in the last `window` seconds whose DAMM v2 pool has been read: LP
+// pulled, still holding ALIVE_LIQUIDITY_USD (latest read), and alive at +7d where that snapshot exists.
+export function outcomesByVerdict(window = 30 * DAY) {
+  const rows = db.query(`SELECT p.verdict, COUNT(*) graduated, TOTAL(cur.lp_pulled) lpPulled, TOTAL(cur.liquidity_usd >= $alive) holding,
+      COUNT(d7.pool) d7, TOTAL(d7.liquidity_usd >= $alive AND d7.volume_usd > 0) d7Alive
+    FROM pools p INDEXED BY pools_graduated_verdict JOIN post_graduation cur ON cur.pool = p.address AND cur.day = -1
+      LEFT JOIN post_graduation d7 ON d7.pool = p.address AND d7.day = 7
+    WHERE p.graduated_at >= $since GROUP BY p.verdict`).all({ $alive: ALIVE_LIQUIDITY_USD, $since: Math.floor(Date.now() / 1000) - window }) as any[];
+  const of = (verdict: number | null) => {
+    const r = rows.find((r) => r.verdict === verdict);
+    return { graduated: r?.graduated ?? 0, lpPulled: r?.lpPulled ?? 0, holding: r?.holding ?? 0, d7: r?.d7 ? { graduated: r.d7, alive: r.d7Alive } : null };
+  };
+  return { window, aliveLiquidityUsd: ALIVE_LIQUIDITY_USD, contested: of(1), uncontested: of(0), unverified: of(null) };
 }
 
 if (import.meta.main) {
