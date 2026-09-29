@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ColumnChart, LineChart, Meter, StackBar, type Series } from "./charts";
 import { ago, compact, duration, feeLabel, lpLabel, num, pct, presetLabel, quoteAmount, quoteSymbol, short, SOL_MINT } from "./format";
+import { useFeed, usePoll } from "./hooks";
 import { Studio } from "./studio";
 
 const SERIES_COLORS = ["var(--s1)", "var(--s2)", "var(--s3)"];
@@ -11,43 +12,6 @@ const WINDOWS = [
   { label: "24h", seconds: 86400 },
   { label: "7d", seconds: 7 * 86400 },
 ];
-
-function usePoll<T>(url: string | null, ms: number) {
-  const [data, setData] = useState<T | null>(null);
-  useEffect(() => {
-    if (!url) return setData(null);
-    let alive = true;
-    const load = () => fetch(url).then((r) => (r.ok ? r.json() : null)).then((d) => alive && setData(d)).catch(() => {});
-    load();
-    const id = setInterval(load, ms);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-  }, [url, ms]);
-  return data;
-}
-
-type FeedItem = { type: "launch" | "graduation" | "config"; ts: number; sig: string; pool?: string; config?: string; name?: string; symbol?: string; mint?: string };
-
-function useFeed(limit = 60) {
-  const [items, setItems] = useState<FeedItem[]>([]);
-  useEffect(() => {
-    let ws: WebSocket;
-    let closed = false;
-    const connect = () => {
-      ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/stream`);
-      ws.onmessage = (e) => setItems((prev) => [JSON.parse(e.data), ...prev].slice(0, limit));
-      ws.onclose = () => !closed && setTimeout(connect, 2000);
-    };
-    connect();
-    return () => {
-      closed = true;
-      ws.close();
-    };
-  }, [limit]);
-  return items;
-}
 
 function App() {
   const [tab, setTab] = useState<"radar" | "presets" | "studio" | "api">("radar");

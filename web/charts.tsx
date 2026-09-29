@@ -127,7 +127,7 @@ export function LineChart(props: {
 }
 
 export function ColumnChart(props: {
-  bars: { label: string; value: number; detail: string }[];
+  bars: { label: string; value: number; detail: string; color?: string }[];
   height?: number;
   format: (v: number) => string;
   color?: string;
@@ -157,7 +157,7 @@ export function ColumnChart(props: {
                 {h > 0 && (
                   <path
                     d={`M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + barW - r}Q${x + barW},${y} ${x + barW},${y + r}V${y + h}Z`}
-                    fill={color} opacity={hover === null || hover === i ? 1 : 0.6}
+                    fill={b.color ?? color} opacity={hover === null || hover === i ? 1 : 0.6}
                   />
                 )}
                 <text x={x + barW / 2} y={y - 6} textAnchor="middle" style={{ fill: "var(--text-2)" }}>{format(b.value)}</text>

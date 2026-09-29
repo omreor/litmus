@@ -125,3 +125,26 @@ export function family(id: string) {
     .all(id);
   return { family: id, configs, odds: graduationOdds(id), recent };
 }
+
+const SOL = "So11111111111111111111111111111111111111112";
+const THRESHOLD_BUCKETS = [0, 5, 15, 40, 80, 150, Infinity];
+
+// Graduation outcomes of SOL-quoted launches we saw, bucketed by the config's migration threshold.
+export function thresholdBenchmarks(since: number) {
+  const rows = db
+    .query(`SELECT json_extract(c.info, '$.migrationThreshold') threshold, p.graduated_at - p.created_at secs
+      FROM pools p JOIN configs c ON c.address = p.config
+      WHERE p.created_at >= $since AND c.quote_mint = $sol`)
+    .all({ $since: since, $sol: SOL }) as { threshold: number; secs: number | null }[];
+  return THRESHOLD_BUCKETS.slice(0, -1).map((min, i) => {
+    const max = THRESHOLD_BUCKETS[i + 1];
+    const inBucket = rows.filter((r) => r.threshold >= min && r.threshold < max);
+    const graduated = inBucket.filter((r) => r.secs !== null);
+    return {
+      min, max: Number.isFinite(max) ? max : null,
+      launches: inBucket.length,
+      graduated: graduated.length,
+      medianSecondsToGraduate: median(graduated.map((r) => r.secs!)),
+    };
+  });
+}

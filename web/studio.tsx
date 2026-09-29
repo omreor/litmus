@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { LineChart, StackBar, type Series } from "./charts";
-import { compact, num, SOL_MINT } from "./format";
+import { ColumnChart, LineChart, StackBar, type Series } from "./charts";
+import { compact, duration, num, pct, SOL_MINT } from "./format";
+import { usePoll } from "./hooks";
 import { DeployPanel } from "./deploy";
 
 export type StudioInput = {
@@ -105,8 +106,10 @@ export function Studio({ seed }: { seed: any }) {
             </select>
           </Field>
           <Field label="Total supply"><NumberInput value={input.supply} onChange={set("supply")} step={1_000_000} /></Field>
-          <Field label={`Starting market cap (${input.quote})`}><NumberInput value={input.initialMcap} onChange={set("initialMcap")} /></Field>
-          <Field label={`Graduation market cap (${input.quote})`}><NumberInput value={input.migrationMcap} onChange={set("migrationMcap")} /></Field>
+          <div className="pair">
+            <Field label={`Start mcap (${input.quote})`}><NumberInput value={input.initialMcap} onChange={set("initialMcap")} /></Field>
+            <Field label={`Graduation mcap (${input.quote})`}><NumberInput value={input.migrationMcap} onChange={set("migrationMcap")} /></Field>
+          </div>
           <Field label="Leftover to receiver (% of supply)" hint="Kept out of the curve and LP; claimable after migration.">
             <NumberInput value={input.leftoverPct} onChange={set("leftoverPct")} step={0.5} />
           </Field>
@@ -131,23 +134,31 @@ export function Studio({ seed }: { seed: any }) {
         </fieldset>
         <fieldset>
           <legend>Fees</legend>
-          <Field label="Starting fee (bps)"><NumberInput value={input.feeStartBps} onChange={set("feeStartBps")} step={25} /></Field>
-          <Field label="Ending fee (bps)"><NumberInput value={input.feeEndBps} onChange={set("feeEndBps")} step={25} /></Field>
-          <Field label="Decay over (seconds)" hint="Anti-sniper: high fee at launch that decays."><NumberInput value={input.feeDecaySeconds} onChange={set("feeDecaySeconds")} step={60} /></Field>
-          <Field label="Decay">
-            <select value={input.feeMode} onChange={(e) => set("feeMode")(e.target.value as StudioInput["feeMode"])}>
-              <option value="linear">Linear</option><option value="exponential">Exponential</option>
-            </select>
-          </Field>
+          <div className="pair">
+            <Field label="Starting fee (bps)"><NumberInput value={input.feeStartBps} onChange={set("feeStartBps")} step={25} /></Field>
+            <Field label="Ending fee (bps)"><NumberInput value={input.feeEndBps} onChange={set("feeEndBps")} step={25} /></Field>
+          </div>
+          <div className="pair">
+            <Field label="Decay over (s)"><NumberInput value={input.feeDecaySeconds} onChange={set("feeDecaySeconds")} step={60} /></Field>
+            <Field label="Decay">
+              <select value={input.feeMode} onChange={(e) => set("feeMode")(e.target.value as StudioInput["feeMode"])}>
+                <option value="linear">Linear</option><option value="exponential">Exponential</option>
+              </select>
+            </Field>
+          </div>
+          <small className="muted">A high starting fee that decays deters snipers.</small>
           <Field label="Creator share of trading fees (%)"><NumberInput value={input.creatorFeePct} onChange={set("creatorFeePct")} /></Field>
           <label className="check"><input type="checkbox" checked={input.dynamicFee} onChange={(e) => set("dynamicFee")(e.target.checked)} /> Dynamic (volatility) fee</label>
         </fieldset>
         <fieldset>
           <legend>Liquidity after graduation</legend>
-          <Field label="Partner, locked %"><NumberInput value={input.lp.partnerLocked} onChange={setLp("partnerLocked")} /></Field>
-          <Field label="Partner, claimable %"><NumberInput value={input.lp.partner} onChange={setLp("partner")} /></Field>
-          <Field label="Creator, locked %"><NumberInput value={input.lp.creatorLocked} onChange={setLp("creatorLocked")} /></Field>
-          <Field label="Creator, claimable %"><NumberInput value={input.lp.creator} onChange={setLp("creator")} /></Field>
+          <div className="pair">
+            <Field label="Partner locked %"><NumberInput value={input.lp.partnerLocked} onChange={setLp("partnerLocked")} /></Field>
+            <Field label="Partner claimable %"><NumberInput value={input.lp.partner} onChange={setLp("partner")} /></Field>
+            <Field label="Creator locked %"><NumberInput value={input.lp.creatorLocked} onChange={setLp("creatorLocked")} /></Field>
+            <Field label="Creator claimable %"><NumberInput value={input.lp.creator} onChange={setLp("creator")} /></Field>
+          </div>
+          <small className="muted">At least 10% must stay locked at day 1 (program rule).</small>
           {lpTotal !== 100 && <p className="warn">LP shares add up to {lpTotal}%, they must total 100%.</p>}
           <Field label="DAMM v2 pool fee">
             <select value={input.migratedPoolFeeBps} onChange={(e) => set("migratedPoolFeeBps")(Number(e.target.value))}>
@@ -186,8 +197,43 @@ export function Studio({ seed }: { seed: any }) {
             </div>
           </section>
         )}
+        {result && <Benchmarks threshold={result.migrationThreshold} quote={input.quote} />}
         <DeployPanel input={input} valid={!!result && !error && lpTotal === 100} />
       </div>
     </div>
+  );
+}
+
+type Bucket = { min: number; max: number | null; launches: number; graduated: number; medianSecondsToGraduate: number | null };
+const bucketLabel = (b: Bucket) => (b.max === null ? `${b.min}+` : `${b.min}-${b.max}`);
+
+function Benchmarks({ threshold, quote }: { threshold: number; quote: string }) {
+  const buckets = usePoll<Bucket[]>("/api/benchmarks/thresholds?window=604800", 60_000);
+  if (quote !== "SOL") return null;
+  const mine = buckets?.find((b) => threshold >= b.min && (b.max === null || threshold < b.max));
+  return (
+    <section className="card">
+      <h2>How similar launches did</h2>
+      <p className="caption">Graduation rate of SOL-quoted launches seen in the last 7 days, by migration threshold. Your curve's bucket is highlighted.</p>
+      {mine && mine.launches > 0 ? (
+        <p>
+          Of <b>{mine.launches}</b> launches with {bucketLabel(mine)} SOL thresholds, <b>{mine.graduated}</b> graduated
+          ({pct(mine.graduated / mine.launches, 1)}){mine.graduated ? `, median ${duration(mine.medianSecondsToGraduate)} after launch` : ""}.
+        </p>
+      ) : (
+        <p className="muted">No launches seen yet with a threshold near {num(threshold)} SOL.</p>
+      )}
+      {buckets && (
+        <ColumnChart
+          format={(v) => pct(v, 1)}
+          bars={buckets.map((b) => ({
+            label: `${bucketLabel(b)} SOL`,
+            value: b.launches ? b.graduated / b.launches : 0,
+            detail: `${b.graduated} of ${b.launches} graduated`,
+            color: b === mine ? "var(--s1)" : "var(--muted)",
+          }))}
+        />
+      )}
+    </section>
   );
 }

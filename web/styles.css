@@ -139,3 +139,5 @@ input, select {
 input[type="range"] { padding: 0; }
 input[type="checkbox"] { width: auto; }
 .check { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--text-2); }
+
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }

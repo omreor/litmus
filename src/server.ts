@@ -2,7 +2,7 @@ import homepage from "../web/index.html";
 import { flushConfigs, redescribeConfigs } from "./enrich";
 import { sweepMetadata } from "./metadata";
 import { subscribeFeed } from "./indexer";
-import { config, families, family, graduationOdds, hotPools, overview } from "./stats";
+import { config, families, family, graduationOdds, hotPools, overview, thresholdBenchmarks } from "./stats";
 import { pollRpc, streamGrpc, streamHealth, streamMirage } from "./stream";
 import { buildStudio } from "./studio";
 import { createConfigTx, createPoolTx, sendSigned, tokenMeta } from "./tx";
@@ -45,6 +45,7 @@ const server = Bun.serve({
       return c ? Response.json(c) : Response.json({ error: "unknown config" }, { status: 404 });
     },
     "/api/pools/hot": () => Response.json(hotPools()),
+    "/api/benchmarks/thresholds": (req) => Response.json(thresholdBenchmarks(since(req))),
     "/api/health": () => Response.json(streamHealth),
     "/api/studio/build": { POST: (req) => handle(req, buildStudio) },
     "/api/studio/deploy": { POST: (req) => handle(req, (b) => createConfigTx(b.input, b.wallet)) },
