@@ -75,6 +75,7 @@ Open http://localhost:3000. Bun also reads variables from a `.env` file in the r
 | `RPC_URL` | Solami RPC with a key, else `https://solana-rpc.publicnode.com` | RPC for account lookups and sending transactions. |
 | `DB_PATH` | `litmus.sqlite` | SQLite file. |
 | `PORT` | `3000` | HTTP port. |
+| `HOST` | `0.0.0.0` | Address the server binds; `127.0.0.1` behind a reverse proxy. |
 | `META_URL` | `https://omreor.github.io/litmus/data/meta/` | Base URL of the metadata (`<mint>.json`) of tokens launched from the Studio; it goes into the token's on-chain URI. The server runs `scripts/publish.sh meta` on every launch to publish it there. |
 | `ARCHIVE_DIR` | `.scratch/raw` | Where `record.ts` archives transactions; the server replays it on start and every 5 minutes. |
 

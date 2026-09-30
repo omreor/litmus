@@ -4,7 +4,8 @@
 # Pages: one force-pushed commit on gh-pages, built in a separate folder so the working tree is never touched.
 # `scripts/publish.sh meta` republishes the last snapshot with fresh token metadata only (seconds, not a
 # minute): the server runs it as soon as it prepares a Studio launch.
-# Env: API (default http://localhost:3300), DB_PATH, METRICS (cloudflared metrics address), OUT, REMOTE, SOLAMI_API_KEY.
+# Env: API (default http://localhost:3300), DB_PATH, LIVE_URL (fixed public API URL; else the tunnel's, read from
+# METRICS, the cloudflared metrics address), OUT, REMOTE, SOLAMI_API_KEY.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 API=${API:-http://localhost:3300}
@@ -57,8 +58,12 @@ rm -rf "$BUILD" && mkdir -p "$BUILD/data"
 bun build "$ROOT/web/index.html" --outdir "$BUILD" --minify >/dev/null
 touch "$BUILD/.nojekyll"
 
-host=$(curl -sf --max-time 5 "$METRICS/quicktunnel" | jq -r '.hostname // empty' || true)
-jq -n --arg host "$host" '{url: (if $host == "" then null else "https://\($host)" end), at: (now | floor)}' > "$BUILD/live.json"
+url=${LIVE_URL:-}
+if [ -z "$url" ]; then
+  host=$(curl -sf --max-time 5 "$METRICS/quicktunnel" | jq -r '.hostname // empty' || true)
+  [ -n "$host" ] && url=https://$host
+fi
+jq -n --arg url "$url" '{url: (if $url == "" then null else $url end), at: (now | floor)}' > "$BUILD/live.json"
 
 # Same naming as apiUrl() in web/hooks.ts: /api/templates?window=3600&organic=1 -> data/templates_window_3600_organic_1.json
 export_route() {
@@ -79,4 +84,4 @@ for id in $(cat "$BUILD"/data/templates_window_*.json 2>/dev/null | jq -r '.[].t
 lock
 rm -rf "$OUT" && mv "$BUILD" "$OUT"
 push "snapshot $(date -u +%FT%TZ)"
-echo "published $(ls data/*.json | wc -l | tr -d ' ') snapshots, live url: ${host:-none}"
+echo "published $(ls data/*.json | wc -l | tr -d ' ') snapshots, live url: ${url:-none}"

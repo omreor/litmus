@@ -141,6 +141,7 @@ function benchmarks(url: URL) {
 
 const server = Bun.serve({
   port: Number(process.env.PORT ?? 3000),
+  hostname: process.env.HOST ?? "0.0.0.0",
   routes: {
     "/": homepage,
     "/api/overview": get("overview", (_, url) => ({ ...overview(since(url)), solUsd })),
