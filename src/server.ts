@@ -26,19 +26,43 @@ refreshSolPrice();
 setInterval(refreshSolPrice, 60_000);
 
 // Usage metrics (traction is judged): requests per route per day, buffered and flushed every minute.
+// Our own snapshot publisher (scripts/publish.sh) identifies itself and is counted apart from everyone else.
+const PUBLISHER_AGENT = "litmus-publisher";
 const today = () => new Date().toISOString().slice(0, 10);
 let hits = new Map<string, number>();
+let visitors = new Set<string>();
 const bumpUsage = db.prepare(`INSERT INTO usage (day, route, count) VALUES (?, ?, ?)
   ON CONFLICT(day, route) DO UPDATE SET count = count + excluded.count`);
 const maxUsage = db.prepare(`INSERT INTO usage (day, route, count) VALUES (?, ?, ?)
   ON CONFLICT(day, route) DO UPDATE SET count = MAX(count, excluded.count)`);
+const addVisitor = db.prepare("INSERT OR IGNORE INTO usage_visitors (day, visitor) VALUES (?, ?)");
+const countVisitors = db.prepare("SELECT COUNT(*) n FROM usage_visitors WHERE day = ?");
 const stream = { current: 0, peak: 0 };
+const salt = { day: "", value: "" };
+// Caddy puts the client address in X-Forwarded-For; requests without it never came through the proxy.
+function countRequest(req: Request, route: string) {
+  if (req.headers.get("user-agent") === PUBLISHER_AGENT) route = `publisher:${route}`;
+  hits.set(route, (hits.get(route) ?? 0) + 1);
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0].trim();
+  if (!ip || route.startsWith("publisher:")) return;
+  if (salt.day !== today()) {
+    salt.day = today();
+    db.query("INSERT OR IGNORE INTO usage_salt (day, salt) VALUES (?, ?)").run(salt.day, crypto.randomUUID());
+    salt.value = (db.query("SELECT salt FROM usage_salt WHERE day = ?").get(salt.day) as { salt: string }).salt;
+  }
+  visitors.add(new Bun.CryptoHasher("sha256").update(salt.value + ip).digest("hex").slice(0, 16));
+}
 setInterval(() => {
-  const [flushed, day] = [hits, today()];
+  const [flushed, seen, day] = [hits, visitors, today()];
   hits = new Map();
+  visitors = new Set();
   db.transaction(() => {
     flushed.forEach((n, route) => bumpUsage.run(day, route, n));
     maxUsage.run(day, "ws:peak", stream.peak);
+    seen.forEach((v) => addVisitor.run(day, v));
+    maxUsage.run(day, "visitors", (countVisitors.get(day) as { n: number }).n);
+    db.query("DELETE FROM usage_visitors WHERE day < ?").run(day);
+    db.query("DELETE FROM usage_salt WHERE day < ?").run(day);
   }).immediate();
 }, 60_000);
 
@@ -50,7 +74,7 @@ const json = (body: unknown, status = 200) => Response.json(body, { status, head
 const notFound = (what: string) => json({ error: `unknown ${what}` }, 404);
 type Req = Request & { params: Record<string, string> };
 const get = (route: string, fn: (req: Req, url: URL) => unknown) => async (req: Req) => {
-  hits.set(route, (hits.get(route) ?? 0) + 1);
+  countRequest(req, route);
   try {
     const body = await fn(req, new URL(req.url));
     return body instanceof Response ? body : json(body);
@@ -181,7 +205,7 @@ const server = Bun.serve({
       return meta ? new Response(meta, { headers: { "content-type": "application/json", ...CORS } }) : json({}, 404);
     },
     "/api/stream": (req, srv) => {
-      hits.set("stream", (hits.get("stream") ?? 0) + 1);
+      countRequest(req, "stream");
       return srv.upgrade(req) ? undefined : new Response("expected websocket", { status: 400 });
     },
   },

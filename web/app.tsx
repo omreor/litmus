@@ -858,7 +858,7 @@ const ENDPOINTS = [
   ["GET /api/pools/hot", "Pools closest to graduation right now, with empirical odds, verdict, evidence and launchpad."],
   ["GET /api/benchmarks/similar?quote=SOL&threshold=85", "Outcome priors: every pool with a similar migration threshold since April 2025, all vs uncontested excluded, by threshold bucket."],
   ["GET /api/health", "Stream transport, updates received, last slot."],
-  ["GET /api/usage", "Requests per route per day, stream subscribers, Studio deploys and launches."],
+  ["GET /api/usage", "External requests per route per day (our snapshot publisher counted apart), distinct visitors per day, stream subscribers, Studio deploys and launches."],
   ["WS /api/stream", "Push feed of launches, graduations and new configs as they land, each with verdict, evidence, receipts and launchpad."],
 ];
 

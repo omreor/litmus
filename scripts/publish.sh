@@ -69,7 +69,7 @@ jq -n --arg url "$url" '{url: (if $url == "" then null else $url end), at: (now 
 export_route() {
   local name=${1#/api/}
   name=${name//[\/?&=]/_}
-  curl -sf --max-time 120 "$API$1" -o "$BUILD/data/$name.json" || { echo "miss $1"; rm -f "$BUILD/data/$name.json"; }
+  curl -sf --max-time 120 -A litmus-publisher "$API$1" -o "$BUILD/data/$name.json" || { echo "miss $1"; rm -f "$BUILD/data/$name.json"; }
 }
 
 routes=(/api/health /api/pools/hot /api/integrity/monthly /api/integrity/postgrad /api/rules "/api/graduations/recent?limit=50" /api/usage

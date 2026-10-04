@@ -128,13 +128,22 @@ export async function configDetail(address: string) {
 const usageRows = db.prepare("SELECT day, route, count FROM usage WHERE day >= ? ORDER BY day DESC, count DESC");
 const studioRows = db.prepare("SELECT signature, kind, at, account FROM studio_txs ORDER BY at DESC LIMIT 50");
 const studioCounts = db.prepare("SELECT kind, COUNT(*) n FROM studio_txs GROUP BY kind");
+// Requests before EXTERNAL_SINCE include our own publisher's (it wasn't told apart yet).
+export const EXTERNAL_SINCE = "2026-10-05";
 export function usage(stream: { current: number; peak: number }) {
-  const days: Record<string, Record<string, number>> = {};
+  const requests: Record<string, Record<string, number>> = {};
+  const publisher: Record<string, Record<string, number>> = {};
   const peaks: Record<string, number> = {};
+  const visitors: Record<string, number> = {};
   for (const r of usageRows.all(new Date(Date.now() - 14 * 86400_000).toISOString().slice(0, 10)) as any[]) {
     if (r.route === "ws:peak") peaks[r.day] = r.count;
-    else (days[r.day] ??= {})[r.route] = r.count;
+    else if (r.route === "visitors") visitors[r.day] = r.count;
+    else if (r.route.startsWith("publisher:")) (publisher[r.day] ??= {})[r.route.slice("publisher:".length)] = r.count;
+    else (requests[r.day] ??= {})[r.route] = r.count;
   }
   const counts = Object.fromEntries((studioCounts.all() as { kind: string; n: number }[]).map((r) => [r.kind, r.n]));
-  return { requests: days, stream: { ...stream, peakByDay: peaks }, studio: { deploys: counts.deploy ?? 0, launches: counts.launch ?? 0, recent: studioRows.all() } };
+  return {
+    externalSince: EXTERNAL_SINCE, requests, publisher, visitors, stream: { ...stream, peakByDay: peaks },
+    studio: { deploys: counts.deploy ?? 0, launches: counts.launch ?? 0, recent: studioRows.all() },
+  };
 }

@@ -144,6 +144,10 @@ CREATE TABLE IF NOT EXISTS post_graduation (
   PRIMARY KEY (pool, day)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS usage (day TEXT NOT NULL, route TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (day, route)) WITHOUT ROWID;
+-- Today's distinct external visitors (server.ts): client IPs hashed with a salt that exists only for that
+-- day. Past days keep just the count (usage route "visitors"); their hashes and salt are deleted.
+CREATE TABLE IF NOT EXISTS usage_visitors (day TEXT NOT NULL, visitor TEXT NOT NULL, PRIMARY KEY (day, visitor)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS usage_salt (day TEXT PRIMARY KEY, salt TEXT NOT NULL);
 -- RPC history replays (replay.ts): one row per pool attempted, so runs resume and report progress.
 CREATE TABLE IF NOT EXISTS replays (pool TEXT PRIMARY KEY, scope TEXT NOT NULL, status TEXT NOT NULL, txs INTEGER NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS studio_txs (signature TEXT PRIMARY KEY, kind TEXT NOT NULL, at INTEGER NOT NULL, account TEXT);
