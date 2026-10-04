@@ -2,9 +2,9 @@
 
 The truth layer for [Meteora's Dynamic Bonding Curve](https://docs.meteora.ag/core-products/dbc/what-is-dbc) (DBC) launches.
 
-**Live: https://omreor.github.io/litmus/** (served from a Mac through a Cloudflare tunnel; when that machine is offline the page falls back to the latest published snapshot and says so).
+**Live: https://omreor.github.io/litmus/** (the API runs on a small VPS; if it's unreachable the page falls back to the latest published snapshot and says so).
 
-About 3,100 DBC bonding curves complete every day. Raw chain stats, DefiLlama and Meteora's DBC API count all of them. Litmus judges every pool and graduation since DBC went live in April 2025:
+More than 3,000 DBC bonding curves complete every day. Raw chain stats, DefiLlama and Meteora's DBC API count all of them. Litmus judges every pool and graduation since DBC went live in April 2025:
 
 - **contested**: independent buyers competed to fill the curve, confirmed from its own transactions;
 - **uncontested**: a rule fired, the curve was filled without real competition (the creator or one bundle filled it, it completed in its creation slot, the threshold was trivial, or it sits on an auto-completing template);
@@ -98,15 +98,15 @@ Notes:
 
 ### Hosting it like the live site
 
+Run `bun src/server.ts` (and `bun src/record.ts`) as services behind a reverse proxy with HTTPS, and `scripts/publish.sh` every 15 minutes:
+
 ```sh
-scripts/run-live.sh        # server on :3300, Cloudflare quick tunnel, caffeinate, publish every 15 min; logs in .scratch/live/
-scripts/run-live.sh stop
-scripts/publish.sh         # one publish: static UI + JSON snapshots + live.json, force-pushed to the gh-pages branch
+LIVE_URL=https://your.api.host scripts/publish.sh   # static UI + JSON snapshots + live.json, force-pushed to the gh-pages branch
 ```
 
-Script env: `PORT` (3300), `DB_PATH`, `CLOUDFLARED`; `publish.sh` also reads `API` (http://localhost:3300), `REMOTE` (the gh-pages remote), `OUT` and `METRICS`.
+`publish.sh` also reads `API` (http://localhost:3300), `DB_PATH`, `REMOTE` (the gh-pages remote) and `OUT`. Its requests identify themselves, so `/api/usage` counts them apart from external traffic.
 
-The page reads `live.json`, probes the tunnel's `/api/health` for 3 s and goes live; otherwise it renders the snapshots in `data/` with a "snapshot as of" banner, and the feed and the Studio pause.
+The page reads `live.json`, probes that API's `/api/health` for 3 s and goes live; otherwise it renders the snapshots in `data/` with a "snapshot as of" banner, and the feed and the Studio pause.
 
 ## Data API
 
@@ -125,7 +125,7 @@ Free, no key, JSON, CORS open on `GET /api/*`. `window` is in seconds. Quote amo
 | `GET /api/pools/:address` | One pool: verdict, evidence, signals, receipts, launchpad, progress, post-graduation outcome |
 | `GET /api/pools/hot` | Pools traded in the last 10 minutes, closest to graduation, with verdict and empirical odds |
 | `GET /api/benchmarks/similar?quote=SOL&threshold=85` | Outcome priors for configs with a similar threshold, all history, by threshold bucket |
-| `GET /api/usage` | Requests per route per day, stream subscribers, Studio deploys and launches |
+| `GET /api/usage` | External requests per route per day (our snapshot publisher counted apart), distinct external IPs per day (counted from daily-salted hashes), stream subscribers, Studio deploys and launches |
 | `GET /api/health` | Stream transport, updates received, last update, slot |
 | `WS /api/stream` | Launches, graduations and new configs as they land, each with verdict fields and launchpad |
 
@@ -165,7 +165,7 @@ src/backfill.ts    full-history load; src/replay.ts history replay; src/record.t
 src/postgrad.ts    DAMM v2 post-graduation reads; src/damm.ts pool decoding
 src/studio.ts      SDK curve builders and validation; src/tx.ts config and pool transactions
 web/               React UI (Bun HTML imports): app.tsx, studio.tsx, deploy.tsx, charts.tsx, hooks.ts (apiUrl, live/snapshot)
-scripts/           run-live.sh, publish.sh
+scripts/           publish.sh
 ```
 
 ## Limitations
