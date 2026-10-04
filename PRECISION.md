@@ -2,6 +2,8 @@
 
 Reviewed 2026-09-29. Litmus judges every Meteora DBC graduation contested, uncontested or unverified ([rules](https://omreor.github.io/litmus/data/rules.json)). This table re-checks those verdicts one by one against each pool's own transactions: a random sample, every pool linked, every disagreement kept.
 
+**Rules v4 (2026-10-04)** adds launchpad fill (the launchpad's own wallet bought at least half the threshold before completion). Re-judging all history under v4 changed none of the 66 contested and uncontested verdicts reviewed here; it turned 26 other contested graduations uncontested, 22 of them on one launchpad identity (8TPACX…zxLc).
+
 **Who reviewed:** an AI agent on the Litmus team, reading each pool's raw transactions and funding transfers (not the rules' output). This is a self-review, not an independent audit; every pool is linked so anyone can repeat it.
 
 ## Result

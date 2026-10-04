@@ -41,7 +41,7 @@ Launchpad identity is the config's fee claimer, except for pads that mint a clai
 
 ## Accuracy
 
-Verdicts (rules v3) were re-checked one by one against each pool's own transactions on 2026-09-29 by an AI agent on the team (a self-review, not an independent audit): a random sample of graduations from the previous 30 days, every transaction re-read from mainnet rather than taken from Litmus' stored evidence, every pool linked and every disagreement kept.
+Verdicts (rules v3) were re-checked one by one against each pool's own transactions on 2026-09-29 by an AI agent on the team (a self-review, not an independent audit): a random sample of graduations from the previous 30 days, every transaction re-read from mainnet rather than taken from Litmus' stored evidence, every pool linked and every disagreement kept. Rules v4 (2026-10-04, launchpad fill) changed none of the reviewed verdicts.
 
 | Verdict | Reviewed | Agree | Disagree | Precision (95% CI) |
 |---|---|---|---|---|
