@@ -718,7 +718,7 @@ function Integrity() {
 
 // Post-graduation outcomes by verdict: a real market keeps liquidity in its DAMM v2 pool, an uncontested fill rarely does.
 type Outcome = { graduated: number; lpPulled: number; holding: number; d7: { graduated: number; alive: number } | null };
-type Outcomes = { window: number; aliveLiquidityUsd: number; contested: Outcome; uncontested: Outcome; unverified: Outcome };
+type Outcomes = { window: number; aliveLiquidityUsd: number; lpPulledMinUsd: number; contested: Outcome; uncontested: Outcome; unverified: Outcome };
 
 function AfterGraduation() {
   const poll = usePoll<Outcomes>("/api/integrity/postgrad", 300_000);
@@ -726,8 +726,9 @@ function AfterGraduation() {
   if (!p?.contested?.graduated || !p.uncontested?.graduated) return null;
   const [c, u] = [p.contested, p.uncontested];
   const alive = `$${num(p.aliveLiquidityUsd, 0)}`;
+  const pulledMin = `$${num(p.lpPulledMinUsd, 0)}`;
   const metrics = [
-    { label: "LP pulled", of: (o: Outcome) => o.lpPulled / o.graduated },
+    { label: `LP pulled (${pulledMin}+)`, of: (o: Outcome) => o.lpPulled / o.graduated },
     { label: `Holding ${alive}+`, of: (o: Outcome) => o.holding / o.graduated },
     ...(c.d7?.graduated && u.d7?.graduated ? [{ label: "Alive at 7d", of: (o: Outcome) => o.d7!.alive / o.d7!.graduated }] : []),
   ];
@@ -740,6 +741,8 @@ function AfterGraduation() {
       </p>
       <p className="caption">
         Graduations in the last {num(p.window / 86400, 0)} days whose DAMM v2 pool Litmus has read: {num(c.graduated, 0)} contested, {num(u.graduated, 0)} uncontested.
+        LP pulled counts pools where liquidity worth at least {pulledMin} at an earlier read was removed; dust positions closed to reclaim rent, and
+        pools already empty when first read, are not counted.
       </p>
       <ColumnChart
         series={[VERDICTS[0], VERDICTS[2]]} max={1} format={share} tickFormat={(v) => pct(v)} height={180}
@@ -874,7 +877,7 @@ const STREAM_ITEM = `type StreamItem = {
   verdict: "contested" | "uncontested" | "unverified";
   contested: boolean | null; // null: unverified (no rule fired, transactions not replayed yet)
   evidence: Record<string, string>; // e.g. { "creator fill": "94% in the creation slot" }
-  signals: { creatorFillPct, creationSlotFillPct, distinctBuyers, nonCreatorVolumePct, sameSlotCompletion, thresholdQuote } | null;
+  signals: { creatorFillPct, creationSlotFillPct, distinctBuyers, nonCreatorVolumePct, sameSlotCompletion, thresholdQuote, fundedSwarmPct, launchpadFillPct } | null;
   receipts: string[];  // transaction signatures backing the evidence
   launchpad: { id: string; name: string | null } | null;
   organic: boolean; reasons: string[];       // v2 aliases: organic = not uncontested

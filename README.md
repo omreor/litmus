@@ -7,7 +7,7 @@ The truth layer for [Meteora's Dynamic Bonding Curve](https://docs.meteora.ag/co
 More than 3,000 DBC bonding curves complete every day. Raw chain stats, DefiLlama and Meteora's DBC API count all of them. Litmus judges every pool and graduation since DBC went live in April 2025:
 
 - **contested**: independent buyers competed to fill the curve, confirmed from its own transactions;
-- **uncontested**: a rule fired, the curve was filled without real competition (the creator or one bundle filled it, it completed in its creation slot, the threshold was trivial, or it sits on an auto-completing template);
+- **uncontested**: a rule fired, the curve was filled without real competition (the creator, the launchpad's own wallet or one bundle filled it, it completed in its creation slot, the threshold was trivial, or it sits on an auto-completing template);
 - **unverified**: no rule fired, but the transactions that would confirm competition haven't been replayed yet.
 
 Every verdict ships with **receipts**: the evidence values and the transaction signatures behind it. As of 2026-09-29 15:43 UTC, of 94,332 graduations in the last 30 days, 495 were contested, 68 unverified and 93,769 uncontested; since April 2025, 909,994 of 920,078 graduations (98.9%) were uncontested (`/api/overview?window=2592000`, `/api/integrity/monthly`).
@@ -35,7 +35,7 @@ The rules, with their thresholds and version, are served by `GET /api/rules` and
 - **Template and launchpad history is a prior, not the verdict.** It only applies to pools without transaction evidence, so the verdict is not circular.
 - **A dev first-buy is normal.** It only counts when it fills most of the curve.
 - **Contested needs proof**: more than a few independent buyers seen from creation and no rule fired. Without that evidence and without a rule firing, a pool is unverified.
-- **After graduation** Litmus reads the pool's DAMM v2 pool: liquidity now, whether LP was pulled, and snapshots one and seven days after graduation for pools graduating from now on.
+- **After graduation** Litmus reads the pool's DAMM v2 pool: liquidity now, whether LP was pulled (liquidity worth $100 or more removed; dust positions closed for rent don't count), and snapshots one and seven days after graduation for pools graduating from now on.
 
 Launchpad identity is the config's fee claimer, except for pads that mint a claimer per token (Bags: their shared leftover receiver) or rotate claimers per config (Perpspad: the wallet that created the config). Names come from a curated table, then Jupiter's `launchpad` label, then on-chain `PartnerMetadata`.
 

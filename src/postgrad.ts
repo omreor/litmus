@@ -1,5 +1,5 @@
 import { dammV2PoolAddress, readDammPools } from "./damm";
-import { ALIVE_LIQUIDITY_USD } from "./integrity";
+import { ALIVE_LIQUIDITY_USD, LP_PULLED_MIN_USD } from "./integrity";
 import { sweepQuotes } from "./metadata";
 import { db } from "./store";
 
@@ -31,7 +31,8 @@ async function quoteUsd(mints: string[]) {
 type Target = { address: string; base_mint: string; quote_mint: string; migration_fee_option: number; decimals: number; graduated_at: number };
 const saveRow = db.prepare(`INSERT OR REPLACE INTO post_graduation (pool, day, at, damm, liquidity, liquidity_usd, fees_a, fees_b, fees_usd, volume_usd, lp_pulled)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-const baseline = db.prepare("SELECT liquidity, fees_a, fees_b FROM post_graduation WHERE pool = ? AND day = 0");
+const baseline = db.prepare("SELECT liquidity, liquidity_usd, fees_a, fees_b FROM post_graduation WHERE pool = ? AND day = 0");
+const latest = db.prepare("SELECT liquidity_usd, lp_pulled FROM post_graduation WHERE pool = ? AND day = -1");
 // Keeps the previous latest read as day -2 when it's at least half a day old.
 const keepPrevious = db.prepare(`INSERT OR REPLACE INTO post_graduation (pool, day, at, damm, liquidity, liquidity_usd, fees_a, fees_b, fees_usd, volume_usd, lp_pulled)
   SELECT pool, -2, at, damm, liquidity, liquidity_usd, fees_a, fees_b, fees_usd, volume_usd, lp_pulled FROM post_graduation
@@ -55,10 +56,14 @@ async function snapshot(targets: Target[], day: number) {
       const [feesA, feesB, liquidity] = [Number(p.feesA), Number(p.feesB), Number(p.liquidity)];
       const liquidityUsd = toUsd(Number(p.reserveB) + Number(p.reserveA) * price);
       const feesUsd = toUsd(feesB + feesA * price);
-      const base = baseline.get(t.address) as { liquidity: number; fees_a: number; fees_b: number } | null;
+      const base = baseline.get(t.address) as { liquidity: number; liquidity_usd: number; fees_a: number; fees_b: number } | null;
+      const previous = latest.get(t.address) as { liquidity_usd: number; lp_pulled: number } | null;
       const volumeUsd = base && p.feeRate > 0 ? toUsd(Math.max(feesB - base.fees_b + (feesA - base.fees_a) * price, 0)) / p.feeRate : null;
-      // LP pulled: more than half the liquidity removed since migration; without a baseline, all of it.
-      const lpPulled = base ? liquidity < base.liquidity / 2 : liquidity === 0;
+      // LP pulled: more than half the liquidity removed since migration (without a baseline, all of it), when
+      // it was worth LP_PULLED_MIN_USD at the earlier read: dust positions closed to reclaim rent don't count.
+      // Without a baseline the earlier read is the previous one, so a pull stays a pull on later reads.
+      const removed = base ? liquidity < base.liquidity / 2 : liquidity === 0;
+      const lpPulled = removed && (previous?.lp_pulled === 1 || ((base ?? previous)?.liquidity_usd ?? 0) >= LP_PULLED_MIN_USD);
       keepPrevious.run(t.address, at - 43_200);
       for (const d of new Set([day, -1]))
         saveRow.run(t.address, d, at, damm[i], liquidity, liquidityUsd, feesA, feesB, feesUsd, d === -1 ? null : volumeUsd, lpPulled ? 1 : 0);
@@ -66,6 +71,15 @@ async function snapshot(targets: Target[], day: number) {
     });
   }).immediate();
   return stored;
+}
+
+// Flags stored before the $100 minimum are re-derived once from the reads still stored: day 0 when there
+// is one, else the read before the latest. Pools already empty at both reads lose the flag.
+if ((db.query("SELECT slot FROM sync WHERE kind = 'lp_pulled'").get() as { slot: number } | null)?.slot !== LP_PULLED_MIN_USD) {
+  db.query(`UPDATE post_graduation AS g SET lp_pulled = 0 WHERE lp_pulled = 1 AND COALESCE(
+      (SELECT b.liquidity_usd FROM post_graduation b WHERE b.pool = g.pool AND b.day = 0),
+      (SELECT b.liquidity_usd FROM post_graduation b WHERE b.pool = g.pool AND b.day = -2 AND g.day = -1), 0) < ?`).run(LP_PULLED_MIN_USD);
+  db.query("INSERT INTO sync (kind, slot) VALUES ('lp_pulled', ?) ON CONFLICT(kind) DO UPDATE SET slot = excluded.slot").run(LP_PULLED_MIN_USD);
 }
 
 const TARGETS = `SELECT p.address, p.base_mint, c.quote_mint, c.migration_fee_option, COALESCE(m.decimals, 9) decimals, p.graduated_at
@@ -150,7 +164,7 @@ export function outcomesByVerdict(window = 30 * DAY) {
     const r = rows.find((r) => r.verdict === verdict);
     return { graduated: r?.graduated ?? 0, lpPulled: r?.lpPulled ?? 0, holding: r?.holding ?? 0, d7: r?.d7 ? { graduated: r.d7, alive: r.d7Alive } : null };
   };
-  return { window, aliveLiquidityUsd: ALIVE_LIQUIDITY_USD, contested: of(1), uncontested: of(0), unverified: of(null) };
+  return { window, aliveLiquidityUsd: ALIVE_LIQUIDITY_USD, lpPulledMinUsd: LP_PULLED_MIN_USD, contested: of(1), uncontested: of(0), unverified: of(null) };
 }
 
 if (import.meta.main) {

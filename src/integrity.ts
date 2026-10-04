@@ -5,7 +5,7 @@ import { db } from "./store";
 // account state: completion time, threshold); template and launchpad verdicts are priors computed from
 // history, used only for pools without transaction evidence. RULES is the single source of truth for
 // thresholds (served at /api/rules); bump RULES_VERSION whenever a rule or threshold changes.
-export const RULES_VERSION = 3;
+export const RULES_VERSION = 4;
 
 const SOL = "So11111111111111111111111111111111111111112";
 const DEFAULT_PUBKEY = "11111111111111111111111111111111";
@@ -92,8 +92,10 @@ const SAME_SLOT_SHARE = 0.5;
 // The 1-bps fee era (until v0.1.7 raised the minimum to 25 bps): big templates that never graduate.
 const VOLUME_FARM = { pools: 200, rate: 0.01, maxFeeBps: 1 };
 
-// Post-graduation: a DAMM v2 pool counts as alive while it holds at least this much liquidity (USD).
+// Post-graduation: a DAMM v2 pool counts as alive while it holds at least this much liquidity (USD), and
+// as LP pulled only when liquidity worth at least LP_PULLED_MIN_USD at an earlier read was removed.
 export const ALIVE_LIQUIDITY_USD = 1000;
+export const LP_PULLED_MIN_USD = 100;
 
 const pct = (x: number) => (x === 1 ? "100%" : x >= 0.1 ? `${Math.round(x * 100)}%` : `${(x * 100).toFixed(1)}%`);
 const count = (n: number) => n.toLocaleString("en-US");
@@ -112,6 +114,10 @@ export const RULES = [
   {
     id: "funded-swarm", name: "Funded swarm", threshold: `>= ${SWARM.buyers} buyers, >= ${pct(SWARM.share)} of the largest buyers' volume`,
     description: "Many buyers, one source: the largest buyers (up to 12, by amount bought) were funded with SOL by the same wallet, directly or one wallet removed, within a day before buying. Exchanges and other hubs don't count unless they co-signed the buys.",
+  },
+  {
+    id: "launchpad-fill", name: "Launchpad fill", threshold: `>= ${pct(CREATOR_FILL)} of threshold`,
+    description: "The launchpad's own wallet (the config's fee claimer, leftover receiver or launchpad identity) bought this much of the curve before it completed, at any time, not just at launch.",
   },
   {
     id: "creator-volume", name: "Creator volume", threshold: `< ${pct(NON_CREATOR_VOLUME)} from others`,
@@ -137,6 +143,10 @@ export const RULES = [
   {
     id: "alive", name: "Alive after graduation", threshold: `>= $${ALIVE_LIQUIDITY_USD.toLocaleString("en-US")} liquidity, trading`,
     description: "Not a verdict rule: the DAMM v2 pool still holds this much liquidity and earns fees at +1d / +7d.",
+  },
+  {
+    id: "lp-pulled", name: "LP pulled", threshold: `>= $${LP_PULLED_MIN_USD} removed`,
+    description: "Not a verdict rule: liquidity worth at least this much at an earlier read (the first read after migration, else the previous read) was removed: more than half of it since migration, or all of it. Dust positions closed to reclaim rent, and pools already empty when first read, are not counted.",
   },
 ];
 
@@ -217,13 +227,16 @@ export type Funding = {
   sampled: number; traced: number; funder: string | null; hops: number | null; buyers: number; share: number; pool_share: number; creator: number;
   cosigned: number; receipts: string;
 };
+// The largest buyer among the config's own wallets (fee claimer, leftover receiver, launchpad identity).
+export type LaunchpadBuy = { wallet: string; volume: number; sig: string | null };
 export type PoolFacts = {
   createdAt: number | null; graduatedAt: number | null; quoteMint: string; threshold: number; decimals: number;
-  template: Prior | null; launchpad: Prior | null; funding?: Funding | null;
+  template: Prior | null; launchpad: Prior | null; funding?: Funding | null; launchpadBuy?: LaunchpadBuy | null;
 };
 export type Signals = {
   creatorFillPct: number | null; creationSlotFillPct: number | null; distinctBuyers: number | null;
   nonCreatorVolumePct: number | null; sameSlotCompletion: boolean | null; thresholdQuote: number; fundedSwarmPct: number | null;
+  launchpadFillPct: number | null;
 };
 export type Judgement = {
   verdict: "contested" | "uncontested" | "unverified"; rules: string[]; reasons: string[];
@@ -249,12 +262,14 @@ export function judge(f: PoolFacts, ev: PoolEvidence | null): Judgement {
       : f.createdAt !== null ? f.graduatedAt! - f.createdAt <= SAME_SLOT_SECONDS : null,
     thresholdQuote: f.threshold / 10 ** f.decimals,
     fundedSwarmPct: complete && f.funding ? f.funding.share : null,
+    // Gross buys, so it can pass 100% when the wallet also sold.
+    launchpadFillPct: complete && f.threshold ? (f.launchpadBuy?.volume ?? 0) / f.threshold : null,
   };
   const rules: string[] = [];
   const reasons: string[] = [];
   const evidence: Record<string, string> = {};
   const firedKeys = new Set<string>();
-  const fundingReceipts: string[] = [];
+  const ruleReceipts: string[] = [];
   const fire = (rule: string, reason: string, key: string) => (rules.push(rule), reasons.push(reason), firedKeys.add(key));
   // Evidence behind a verdict first, the rest after it.
   const result = (verdict: Judgement["verdict"]): Judgement => ({
@@ -292,7 +307,15 @@ export function judge(f: PoolFacts, ev: PoolEvidence | null): Judgement {
       : `no common funder among the ${funding.sampled} largest buyers (${funding.traced} traced)`;
     if (graduated && funding.buyers >= SWARM.buyers && funding.share >= SWARM.share) {
       fire("funded-swarm", `funded swarm: ${evidence["funding source"]}`, "funding source");
-      fundingReceipts.push(...(JSON.parse(funding.receipts) as string[]));
+      ruleReceipts.push(...(JSON.parse(funding.receipts) as string[]));
+    }
+  }
+  if (signals.launchpadFillPct && f.launchpadBuy) {
+    const { wallet } = f.launchpadBuy;
+    evidence["launchpad fill"] = `${wallet.slice(0, 4)}…${wallet.slice(-4)} (the launchpad's own wallet) bought ${pct(signals.launchpadFillPct)} of the threshold`;
+    if (graduated && signals.launchpadFillPct >= CREATOR_FILL) {
+      fire("launchpad-fill", `launchpad fill: ${evidence["launchpad fill"]}`, "launchpad fill");
+      if (f.launchpadBuy.sig) ruleReceipts.push(f.launchpadBuy.sig);
     }
   }
   if (f.quoteMint === SOL && f.threshold < SUB_THRESHOLD_SOL * 1e9) {
@@ -304,7 +327,7 @@ export function judge(f: PoolFacts, ev: PoolEvidence | null): Judgement {
     evidence["volume farm"] = f.template!.reasons[farm].replace("volume farm: ", "");
     fire("volume-farm", f.template!.reasons[farm], "volume farm");
   }
-  const receipts = creation ? [...new Set([creation.creation_sig, creation.creator_fill_sig, creation.completion_sig, ...fundingReceipts].filter((s) => s !== null))] : [];
+  const receipts = creation ? [...new Set([creation.creation_sig, creation.creator_fill_sig, creation.completion_sig, ...ruleReceipts].filter((s) => s !== null))] : [];
   if (rules.length) return result("uncontested");
   // Priors don't decide against transaction evidence, but stay visible next to it, marked as outweighed.
   const priorNotes = () =>
@@ -341,7 +364,12 @@ const priorOf = (row: { rules: string | null; reasons: string } | null): Prior |
   row?.rules ? { rules: JSON.parse(row.rules), reasons: JSON.parse(row.reasons) } : null;
 const templatePrior = db.prepare("SELECT rules, reasons FROM templates WHERE template = ?");
 const launchpadPrior = db.prepare("SELECT rules, reasons FROM launchpads WHERE id = ?");
-const poolFactsRow = db.prepare(`SELECT p.created_at, p.graduated_at, c.quote_mint, c.threshold, c.template, c.launchpad, COALESCE(m.decimals, 9) decimals
+// pool_buyers only holds buys made on the curve, so this is what the wallet bought before completion.
+const LAUNCHPAD_BUY = `(SELECT json_object('wallet', b.wallet, 'volume', b.volume, 'sig', b.sig) FROM pool_buyers b
+  WHERE b.pool = p.address AND b.wallet IN (c.fee_claimer, c.leftover_receiver, c.launchpad) ORDER BY b.volume DESC LIMIT 1)`;
+const launchpadBuyOf = (json: string | null) => (json ? (JSON.parse(json) as LaunchpadBuy) : null);
+const poolFactsRow = db.prepare(`SELECT p.created_at, p.graduated_at, c.quote_mint, c.threshold, c.template, c.launchpad, COALESCE(m.decimals, 9) decimals,
+  ${LAUNCHPAD_BUY} launchpad_buy
   FROM pools p LEFT JOIN configs c ON c.address = p.config LEFT JOIN mints m ON m.mint = c.quote_mint WHERE p.address = ?`);
 const saveVerdict = db.prepare("UPDATE pools SET verdict = ?, rules = ? WHERE address = ?");
 const fundingRow = db.prepare("SELECT sampled, traced, funder, hops, buyers, share, pool_share, creator, cosigned, receipts FROM pool_funding WHERE pool = ?");
@@ -352,7 +380,7 @@ export function judgementOf(pool: string) {
   return judge({
     createdAt: r.created_at, graduatedAt: r.graduated_at, quoteMint: r.quote_mint ?? SOL, threshold: r.threshold ?? 0, decimals: r.decimals,
     template: r.template ? priorOf(templatePrior.get(r.template) as any) : null, launchpad: r.launchpad ? priorOf(launchpadPrior.get(r.launchpad) as any) : null,
-    funding: fundingRow.get(pool) as Funding | null,
+    funding: fundingRow.get(pool) as Funding | null, launchpadBuy: launchpadBuyOf(r.launchpad_buy),
   }, evidenceOf(pool));
 }
 
@@ -372,7 +400,8 @@ export function judgeAll(chunk = 50_000) {
   const maxRowid = (db.query("SELECT MAX(rowid) n FROM pools").get() as { n: number }).n ?? 0;
   const rows = db.prepare(`SELECT p.address, p.created_at, p.graduated_at, p.verdict, p.rules, c.quote_mint, c.threshold, c.template, c.launchpad,
       e.pool e_pool, e.*, f.pool f_pool, f.sampled f_sampled, f.traced f_traced, f.funder f_funder, f.hops f_hops, f.buyers f_buyers,
-      f.share f_share, f.pool_share f_pool_share, f.creator f_creator, f.cosigned f_cosigned, f.receipts f_receipts
+      f.share f_share, f.pool_share f_pool_share, f.creator f_creator, f.cosigned f_cosigned, f.receipts f_receipts,
+      CASE WHEN e.pool IS NOT NULL THEN ${LAUNCHPAD_BUY} END launchpad_buy
     FROM pools p LEFT JOIN configs c ON c.address = p.config LEFT JOIN pool_evidence e ON e.pool = p.address LEFT JOIN pool_funding f ON f.pool = p.address
     WHERE p.rowid > ? AND p.rowid <= ?`);
   const counts = { contested: 0, uncontested: 0, unverified: 0, changed: 0 };
@@ -386,6 +415,7 @@ export function judgeAll(chunk = 50_000) {
           sampled: r.f_sampled, traced: r.f_traced, funder: r.f_funder, hops: r.f_hops, buyers: r.f_buyers, share: r.f_share, pool_share: r.f_pool_share, creator: r.f_creator,
           cosigned: r.f_cosigned, receipts: r.f_receipts,
         } : null,
+        launchpadBuy: launchpadBuyOf(r.launchpad_buy),
       }, r.e_pool ? r : null);
       counts[j.verdict]++;
       const [verdict, rules] = [VERDICT_CODE[j.verdict], j.rules.join(",") || null];

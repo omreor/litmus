@@ -56,6 +56,19 @@ test("a buyer swarm funded by one wallet is uncontested, with the funding transa
   expect(judge(facts({ funding: { ...funding, funder: null, buyers: 0, share: 0 } }), ev()).evidence["funding source"]).toContain("no common funder");
 });
 
+// Shape of DxePvJ6D… (2026-10-04, launchpad 8TPACX…zxLc): 10 buyers filled a 10 SOL curve in 25 slots, no creator fill and no
+// common funder, but the launchpad's own fee-claimer wallet bought 18.3 SOL of it after the creation slot.
+test("the launchpad's own wallet buying half the curve is uncontested, with its buy as a receipt", () => {
+  const launchpadBuy = { wallet: "8TPACXaKotSZ7WXktfmKDRhgoypyGXNzo1ctr2YBzxLc", volume: 18.344e9, sig: "lpbuy" };
+  const shape = { threshold: 10e9, funding: { sampled: 10, traced: 10, funder: null, hops: null, buyers: 0, share: 0, pool_share: 0, creator: 0, cosigned: 0, receipts: "[]" } };
+  const e = ev({ buyers: 10, trades: 22, buy_volume: 24.5e9, sell_volume: 0, creator_volume: 0, completion_slot: 35 });
+  expect(judge(facts(shape), e).verdict).toBe("contested");
+  const j = judge(facts({ ...shape, launchpadBuy }), e);
+  expect(j.rules).toEqual(["launchpad-fill"]);
+  expect(j.receipts).toContain("lpbuy");
+  expect(judge(facts({ ...shape, launchpadBuy: { ...launchpadBuy, volume: 4e9 } }), e).verdict).toBe("contested");
+});
+
 // Mainnet swap (2026-09-29): one swap2 instruction emits both EvtSwap and EvtSwap2.
 const SWAP_TX = {"sig":"2ypU8Fam4xbu1Tb4iC2MeS2VwL7HB34RVABRLeqz6wMYaV6FWhiA3XQfvsUEtsvGABuF856x89RhzdgixJ6YV2Mq","slot":451622025,"seen":1790679600,"keys":["5jdx3oir1YfT6w1h2oG3k8ympDgcQ7pFH1pifgVa389P","CfdX89WFJpf1hVPFJJ4RYYiEFRAKQ5QDTJiVsQTbjWnZ","G474CkX4pK1odFwtfVMteA657HvJKHUTK4Svi5NNNa6F","BfV6fjCxRoyBzMnexET9YghWZdV463cMStEb9RELS7VX","HNH29mZXKufkg7et9eMr6ZtRs4EZoxqrk7WiDfNGF1Rh","A5mQYBNd5uqTXzf7nsoztVLJ5zwnUdprV4GTwhc1y4uB","ComputeBudget111111111111111111111111111111","ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL","So11111111111111111111111111111111111111112","11111111111111111111111111111111","TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","AgXqSDdngnHVRD8E5nNvtpdyETnZB2hTaMvS8mDwD4kg","TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb","dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN","FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM","EZmnjPixJw8JHS71LrztKXfqbCzA5HnQFbYSraZzNYpk","8Ks12pbrD6PXxfty1hVQiE9sc289zgU1zHkvXhrSdriF"],"ixs":[{"inner":false,"accounts":[14,15,3,1,2,4,5,11,8,0,12,10,13,16,13],"data":"QUs/TOtbW4jtuBkHAAAAAFQ/RXg6AAAAAA=="},{"inner":true,"accounts":[16],"data":"5EWlLlHLmh0bPBXViqq7k55wtc+5QnuYSh77wH2zgfTygZ+k7lwoiDPlBDTH7IaGyY0ojZPgGoqSQnVqUhZrCWFpYlzVbvYwrMVARsEx+8UBAO24GQcAAAAAVD9FeDoAAADtuBkHAAAAAA0lK/E6AAAAa4K/OTCXkQUAAAAAAAAAAFAEQR4AAAAAE0GQBwAAAAAAAAAAAAAAAO24GQcAAAAAL5q7agAAAAA="},{"inner":true,"accounts":[16],"data":"5EWlLlHLmh29QjOoJlB1mZ5wtc+5QnuYSh77wH2zgfTygZ+k7lwoiDPlBDTH7IaGyY0ojZPgGoqSQnVqUhZrCWFpYlzVbvYwrMVARsEx+8UBAO24GQcAAAAAVD9FeDoAAAAA7bgZBwAAAADtuBkHAAAAAAAAAAAAAAAADSUr8ToAAABrgr85MJeRBQAAAAAAAAAAUARBHgAAAAATQZAHAAAAAAAAAAAAAAAAxC6zdQIAAAAAgXWOAgAAAC+au2oAAAAA"}]};
 
