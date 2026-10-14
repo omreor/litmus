@@ -10,7 +10,7 @@ import { outcomesByVerdict, readHistory, snapshotGraduations } from "./postgrad"
 import { replay } from "./replay";
 import { configDetail, graduationsRecent, hotPools, overview, poolDetail, usage } from "./stats";
 import { db } from "./store";
-import { pollRpc, streamGrpc, streamHealth, streamMirage } from "./stream";
+import { healthReport, pollRpc, streamGrpc, streamMirage } from "./stream";
 import { buildStudio } from "./studio";
 import { createConfigTx, createPoolTx, sendSigned, studioAction, tokenMeta } from "./tx";
 
@@ -184,7 +184,7 @@ const server = Bun.serve({
     "/api/benchmarks/similar": get("benchmarks/similar", (_, url) => benchmarks(url)),
     "/api/rules": get("rules", () => ({ version: RULES_VERSION, rules: RULES })),
     "/api/usage": get("usage", () => usage(stream)),
-    "/api/health": get("health", () => streamHealth),
+    "/api/health": get("health", healthReport),
     "/api/studio/build": post(buildStudio),
     "/api/studio/deploy": post((b) => createConfigTx(b.input, b.wallet)),
     "/api/studio/launch": post(async (b) => {
@@ -266,7 +266,7 @@ every(300_000, "archive", replayArchive);
 sweepQuotes().catch((e) => console.error("quotes", e));
 const { SOLAMI_API_KEY, SOLAMI_GRPC_URL = "https://grpc.solami.dev", MIRAGE_ID } = process.env;
 if (SOLAMI_API_KEY && MIRAGE_ID) streamMirage(MIRAGE_ID, SOLAMI_API_KEY);
-else if (SOLAMI_API_KEY) await streamGrpc(SOLAMI_GRPC_URL, SOLAMI_API_KEY);
+else if (SOLAMI_API_KEY) streamGrpc(SOLAMI_GRPC_URL, SOLAMI_API_KEY);
 else pollRpc();
 setTimeout(() => console.log("archive catch-up", replayArchive()), 90_000);
 console.log(`litmus on ${server.url}`);

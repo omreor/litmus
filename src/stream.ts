@@ -43,16 +43,53 @@ const subscribeRequest: SubscribeRequest = {
   accounts: {}, slots: {}, transactionsStatus: {}, blocks: {}, entry: {}, accountsDataSlice: [],
 };
 
+// A stream can go silent without an error or a close: on 2026-10-06 the Solami trial ended and the gRPC
+// stream stopped delivering (pings unanswered) for 8 days while the connection stayed open.
+const STALL_MS = 180_000;
+const LIVE_MS = 30_000;
+const GRPC_ATTEMPTS = 3;
+const stalled = () => Date.now() - Math.max(streamHealth.lastUpdateAt, streamHealth.connectedAt) > STALL_MS;
+
+export const healthReport = () => ({ ...streamHealth, live: Date.now() - streamHealth.lastUpdateAt < LIVE_MS });
+
+// Reconnects whenever a session stalls or dies; after GRPC_ATTEMPTS sessions in a row that delivered
+// nothing, falls back to the RPC sampler for the life of the process.
+// ponytail: no switch back to gRPC; restart the server once the key streams again.
 export async function streamGrpc(endpoint: string, token: string) {
+  for (let failures = 0; failures < GRPC_ATTEMPTS; ) {
+    const before = streamHealth.updates;
+    try {
+      await grpcSession(endpoint, token);
+      console.error("grpc stream stalled or closed, reconnecting");
+    } catch (e) {
+      console.error("grpc", String(e).slice(0, 300));
+    }
+    failures = streamHealth.updates > before ? 0 : failures + 1;
+    await Bun.sleep(5_000);
+  }
+  console.error(`grpc delivered nothing in ${GRPC_ATTEMPTS} attempts, falling back to the RPC sampler`);
+  pollRpc();
+}
+
+async function grpcSession(endpoint: string, token: string) {
   const client = new Client(endpoint, token, undefined, { enabled: true });
   await client.connect();
   const stream = await client.subscribe();
   stream.on("data", handleUpdate);
-  stream.on("error", (e) => console.error("grpc stream", e));
+  stream.on("error", (e) => console.error("grpc stream", String(e).slice(0, 300)));
   stream.write(subscribeRequest);
   Object.assign(streamHealth, { transport: "solami-grpc", connectedAt: Date.now() });
   // Keep load balancers from idling the stream out.
-  setInterval(() => stream.write({ ...subscribeRequest, ping: { id: 1 } }), 15_000);
+  const ping = setInterval(() => stream.write({ ...subscribeRequest, ping: { id: 1 } }), 15_000);
+  await new Promise<void>((resolve) => {
+    const watch = setInterval(() => {
+      if (!stream.destroyed && !stalled()) return;
+      clearInterval(watch);
+      resolve();
+    }, 10_000);
+  });
+  clearInterval(ping);
+  stream.destroy();
 }
 
 // Mirage: the subscription (filter) is created once in the Solami dashboard or via POST /mirage/create.
@@ -85,8 +122,8 @@ export function normalizeRpcTx(sig: string, tx: VersionedTransactionResponse): D
   };
 }
 
-// ponytail: RPC sampler for local dev only - public RPCs can't keep up with the full DBC firehose,
-// so it takes the newest `perPoll` transactions each round and skips the rest.
+// ponytail: RPC sampler, for local dev and as the gRPC fallback. RPC can't keep up with the full DBC
+// firehose, so it takes the newest `perPoll` transactions each round and skips the rest (the UI says so).
 export async function pollRpc(perPoll = 15, intervalMs = 3000) {
   const program = new PublicKey(DBC_PROGRAM_ID);
   Object.assign(streamHealth, { transport: "rpc-sampler", connectedAt: Date.now() });

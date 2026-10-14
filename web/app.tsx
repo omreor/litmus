@@ -51,7 +51,8 @@ function App() {
   const [hideUncontestedPads, setHideUncontestedPads] = useState(false);
   const [fork, setFork] = useState<Fork | null>(null);
   const health = usePoll<any>("/api/health", 5000).data;
-  const live = health && Date.now() - health.lastUpdateAt < 15_000;
+  const live = !!health?.live;
+  const sampled = health?.transport === "rpc-sampler";
   useEffect(() => {
     const onHashChange = () => {
       setTab(tabFromHash());
@@ -77,7 +78,11 @@ function App() {
         ) : (
           <div className="status">
             <span className="dot" style={{ background: live ? "var(--good)" : "var(--muted)" }} />
-            {live ? `Live via ${health.transport}` : "Connecting"}
+            {!live ? "Connecting" : sampled ? (
+              <span title="The full stream is unavailable. The feed samples the newest DBC transactions over RPC every few seconds and misses most of them, so recent counts are incomplete.">
+                Live, sampled via RPC
+              </span>
+            ) : `Live via ${health.transport}`}
             {health?.slot ? <span className="mono muted">slot {health.slot.toLocaleString()}</span> : null}
           </div>
         )}
